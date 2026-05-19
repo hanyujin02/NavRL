@@ -9,8 +9,7 @@ from omni_drones.robots.drone import MultirotorBase
 from omni.isaac.orbit.assets import AssetBaseCfg
 from omni.isaac.orbit.terrains import TerrainImporterCfg, TerrainImporter, TerrainGeneratorCfg, HfDiscreteObstaclesTerrainCfg
 from omni_drones.utils.torch import euler_to_quaternion, quat_axis
-from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, patterns
-from omni.isaac.core.utils.viewports import set_camera_view
+from omni.isaac.orbit.sensors import RayCasterCamera, RayCasterCameraCfg, patterns
 from utils import vec_to_new_frame, vec_to_world, construct_input
 import omni.isaac.core.utils.prims as prim_utils
 import omni.isaac.orbit.sim as sim_utils
@@ -29,37 +28,34 @@ class NavigationEnv(IsaacEnv):
 
     def __init__(self, cfg):
         print("[Navigation Environment]: Initializing Env...")
-        # LiDAR params:
-        self.lidar_range = cfg.sensor.lidar_range
-        self.lidar_vfov = (max(-89., cfg.sensor.lidar_vfov[0]), min(89., cfg.sensor.lidar_vfov[1]))
-        self.lidar_vbeams = cfg.sensor.lidar_vbeams
-        self.lidar_hres = cfg.sensor.lidar_hres
-        self.lidar_hbeams = int(360/self.lidar_hres)
+        # Depth camera params
+        self.depth_range = cfg.sensor.depth_range
+        self.depth_height = cfg.sensor.depth_height
+        self.depth_width = cfg.sensor.depth_width
 
         super().__init__(cfg, cfg.headless)
-        
+
         # Drone Initialization
         self.drone.initialize()
         self.init_vels = torch.zeros_like(self.drone.get_velocities())
 
-
-        # LiDAR Intialization
-        ray_caster_cfg = RayCasterCfg(
+        # Depth Camera Initialization (raycasting-based, no render pipeline)
+        depth_camera_cfg = RayCasterCameraCfg(
             prim_path="/World/envs/env_.*/Hummingbird_0/base_link",
-            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
+            offset=RayCasterCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
             attach_yaw_only=True,
-            # attach_yaw_only=False,
-            pattern_cfg=patterns.BpearlPatternCfg(
-                horizontal_res=self.lidar_hres, # horizontal default is set to 10
-                vertical_ray_angles=torch.linspace(*self.lidar_vfov, self.lidar_vbeams) 
+            pattern_cfg=patterns.PinholeCameraPatternCfg(
+                focal_length=cfg.sensor.focal_length,
+                horizontal_aperture=cfg.sensor.horizontal_aperture,
+                height=self.depth_height,
+                width=self.depth_width,
             ),
+            data_types=["distance_to_image_plane"],
             debug_vis=False,
             mesh_prim_paths=["/World/ground"],
-            # mesh_prim_paths=["/World"],
         )
-        self.lidar = RayCaster(ray_caster_cfg)
-        self.lidar._initialize_impl()
-        self.lidar_resolution = (self.lidar_hbeams, self.lidar_vbeams) 
+        self.depth_camera = RayCasterCamera(depth_camera_cfg)
+        self.depth_camera._initialize_impl()
         
         # start and target 
         with torch.device(self.device):
@@ -300,7 +296,7 @@ class NavigationEnv(IsaacEnv):
             "agents": CompositeSpec({
                 "observation": CompositeSpec({
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device), 
-                    "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.lidar_vbeams), device=self.device),
+                    "depth": UnboundedContinuousTensorSpec((1, self.depth_height, self.depth_width), device=self.device),
                     "direction": UnboundedContinuousTensorSpec((1, 3), device=self.device),
                     "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.device),
                 }),
@@ -425,7 +421,7 @@ class NavigationEnv(IsaacEnv):
     def _post_sim_step(self, tensordict: TensorDictBase):
         if (self.cfg.env_dyn.num_obstacles != 0):
             self.move_dynamic_obstacle()
-        self.lidar.update(self.dt)
+        self.depth_camera.update(self.dt)
     
     # get current states/observation
     def _compute_state_and_obs(self):
@@ -433,26 +429,13 @@ class NavigationEnv(IsaacEnv):
         self.info["drone_state"][:] = self.root_state[..., :13] # info is for controller
 
         # >>>>>>>>>>>>The relevant code starts from here<<<<<<<<<<<<
-        # -----------Network Input I: LiDAR range data--------------
-        self.lidar_scan = self.lidar_range - (
-            (self.lidar.data.ray_hits_w - self.lidar.data.pos_w.unsqueeze(1))
-            .norm(dim=-1)
-            .clamp_max(self.lidar_range)
-            .reshape(self.num_envs, 1, *self.lidar_resolution)
-        ) # lidar scan store the data that is range - distance and it is in lidar's local frame
-
-        # Optional render for LiDAR
-        if self._should_render(0):
-            self.debug_draw.clear()
-            x = self.lidar.data.pos_w[0]
-            # set_camera_view(
-            #     eye=x.cpu() + torch.as_tensor(self.cfg.viewer.eye),
-            #     target=x.cpu() + torch.as_tensor(self.cfg.viewer.lookat)                        
-            # )
-            v = (self.lidar.data.ray_hits_w[0] - x).reshape(*self.lidar_resolution, 3)
-            # self.debug_draw.vector(x.expand_as(v[:, 0]), v[:, 0])
-            # self.debug_draw.vector(x.expand_as(v[:, -1]), v[:, -1])
-            self.debug_draw.vector(x.expand_as(v[:, 0])[0], v[0, 0])
+        # -----------Network Input I: Depth image-------------------
+        # RayCasterCamera output: (num_envs, H, W, 1) → (num_envs, 1, H, W)
+        depth_data = self.depth_camera.data.output["distance_to_image_plane"]
+        depth_data = depth_data.nan_to_num(nan=self.depth_range, posinf=self.depth_range)
+        depth_data = depth_data[..., 0].unsqueeze(1).clamp(max=self.depth_range)
+        # Inverted depth: large value = near obstacle (same convention as prior lidar_scan)
+        self.depth_scan = self.depth_range - depth_data
 
         # ---------Network Input II: Drone's internal states---------
         # a. distance info in horizontal and vertical plane
@@ -486,7 +469,7 @@ class NavigationEnv(IsaacEnv):
             dyn_obs_rpos_expanded[:, int(self.dyn_obs_state.size(0)/2):, 2] = 0.
             dyn_obs_distance_2d = torch.norm(dyn_obs_rpos_expanded[..., :2], dim=2)  # Shape: (1000, 40). calculate 2d distance to each obstacle for all drones
             _, closest_dyn_obs_idx = torch.topk(dyn_obs_distance_2d, self.cfg.algo.feature_extractor.dyn_obs_num, dim=1, largest=False) # pick top N closest obstacle index
-            dyn_obs_range_mask = dyn_obs_distance_2d.gather(1, closest_dyn_obs_idx) > self.lidar_range
+            dyn_obs_range_mask = dyn_obs_distance_2d.gather(1, closest_dyn_obs_idx) > self.depth_range
 
             # relative distance of obstacles in the goal frame
             closest_dyn_obs_rpos = torch.gather(dyn_obs_rpos_expanded, 1, closest_dyn_obs_idx.unsqueeze(-1).expand(-1, -1, 3))
@@ -529,7 +512,7 @@ class NavigationEnv(IsaacEnv):
 
             # distance to dynamic obstacle for reward calculation (not 100% correct in math but should be good enough for approximation)
             closest_dyn_obs_distance_reward = closest_dyn_obs_rpos.norm(dim=-1) - closest_dyn_obs_size[..., 0]/2. # for those 2D obstacle, z distance will not be considered
-            closest_dyn_obs_distance_reward[dyn_obs_range_mask] = self.cfg.sensor.lidar_range
+            closest_dyn_obs_distance_reward[dyn_obs_range_mask] = self.cfg.sensor.depth_range
             
         else:
             dyn_obs_states = torch.zeros(self.num_envs, 1, self.cfg.algo.feature_extractor.dyn_obs_num, 10, device=self.cfg.device)
@@ -538,7 +521,7 @@ class NavigationEnv(IsaacEnv):
         # -----------------Network Input Final--------------
         obs = {
             "state": drone_state,
-            "lidar": self.lidar_scan,
+            "depth": self.depth_scan,
             "direction": target_dir_2d,
             "dynamic_obstacle": dyn_obs_states
         }
@@ -546,12 +529,12 @@ class NavigationEnv(IsaacEnv):
 
         # -----------------Reward Calculation-----------------
         # a. safety reward for static obstacles
-        reward_safety_static = torch.log((self.lidar_range-self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
+        reward_safety_static = torch.log((self.depth_range - self.depth_scan).clamp(min=1e-6, max=self.depth_range)).mean(dim=(2, 3))
         
 
         # b. safety reward for dynamic obstacles
         if (self.cfg.env_dyn.num_obstacles != 0):
-            reward_safety_dynamic = torch.log((closest_dyn_obs_distance_reward).clamp(min=1e-6, max=self.lidar_range)).mean(dim=-1, keepdim=True)
+            reward_safety_dynamic = torch.log((closest_dyn_obs_distance_reward).clamp(min=1e-6, max=self.depth_range)).mean(dim=-1, keepdim=True)
 
         # c. velocity reward for goal direction
         vel_direction = rpos / distance.clamp_min(1e-6)
@@ -567,7 +550,7 @@ class NavigationEnv(IsaacEnv):
 
 
         # f. Collision condition with its penalty
-        static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") >  (self.lidar_range - 0.3) # 0.3 collision radius
+        static_collision = einops.reduce(self.depth_scan, "n 1 h w -> n 1", "max") > (self.depth_range - 0.3)
         collision = static_collision | dynamic_collision
         
         # Final reward calculation

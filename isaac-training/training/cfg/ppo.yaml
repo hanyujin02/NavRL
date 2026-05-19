@@ -2,6 +2,57 @@ algo:
   feature_extractor:
     learning_rate: 5e-4
     dyn_obs_num: 5
+
+    # Depth encoder selection
+    # 'scratch'         — simple 3-layer CNN, trained from scratch (default)
+    # ReachMap encoders — import from /ReachMap/model/:
+    #   'cnn'               CNNOnlyEncoder        (no temporal)
+    #   'vit'               ViTOnlyEncoder        (no temporal)
+    #   'cnn_gru'           TemporalCNNEncoder    (CNN + GRU)
+    #   'vit_gru'           TemporalViTEncoder    (ViT + GRU)
+    #   'cnn_transformer'   TemporalTransformerCNNEncoder
+    #   'vit_transformer'   TemporalTransformerViTEncoder
+    #   'rep_cnn'           RepCNNOnlyEncoder     (pretrained vitfly ConvNet)
+    #   'rep_cnn_gru'       RepCNNGRUEncoder
+    #   'rep_cnn_transformer' RepCNNTransformerEncoder
+    #   'rep_vit'           RepViTOnlyEncoder     (pretrained vitfly ViT)
+    #   'rep_vit_gru'       RepViTGRUEncoder
+    #   'rep_vit_transformer' RepViTTransformerEncoder
+    #   'rep_vae'           RepVAEOnlyEncoder     (pretrained mavrl VAE)
+    #   'rep_vae_gru'       RepVAEGRUEncoder
+    #   'rep_vae_transformer' RepVAETransformerEncoder
+    encoder_type: scratch
+
+    # Path to a ReachMap checkpoint (best.pt / latest.pt) to initialise the
+    # encoder weights.  Only used when encoder_type != 'scratch'.
+    # The encoder.* sub-keys are extracted automatically; task heads are ignored.
+    encoder_ckpt: null
+
+    # Freeze encoder weights after loading checkpoint (fine-tune PPO heads only)
+    freeze_encoder: false
+
+    # Output feature dimension (must match embed_dim used when training the ckpt)
+    embed_dim: 256
+
+    # Depth image dimensions fed to the encoder (should match sensor config)
+    img_h: 64
+    img_w: 64
+
+    # ViT spatial encoder settings (used for 'vit*' and 'rep_vit*' types)
+    patch_size: 8      # 64/8 = 8 patches per side for 64x64 input
+    vit_depth: 4
+    num_heads: 8
+
+    # GRU / Transformer temporal settings (used for *_gru and *_transformer types)
+    gru_layers: 2
+    seq_len: 10
+    temporal_depth: 2
+    temporal_heads: 8
+    drop: 0.1
+
+    # RepBaseline backbone settings (used for 'rep_*' types only)
+    rep_depth_max_m: 4.0   # should match sensor.depth_range
+    rep_vae_latent: 64
   
   actor:
     learning_rate: 5e-4

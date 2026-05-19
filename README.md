@@ -140,6 +140,71 @@ After training for a sufficient amount of time, you should observe the robots le
 https://github.com/user-attachments/assets/2294bd94-69b3-4ce8-8e91-0118cfae9bcd
 
 
+### Train with Depth Camera (RayCasterCamera)
+This section covers training NavRL with a **depth image** as the visual input instead of LiDAR, using Isaac Orbit's `RayCasterCamera` (raycasting-based, no render pipeline overhead).
+
+The configuration file for depth training is `NavRL/isaac-training/training/cfg/train_depth.yaml`.
+
+#### Run a depth training example
+```bash
+conda activate NavRL
+cd NavRL/isaac-training
+
+# Verify installation with default settings (2 envs, headless=False)
+python training/scripts/train.py --config-name=train_depth
+
+# Full training run (RTX 4090 recommended)
+python training/scripts/train.py --config-name=train_depth \
+    headless=True env.num_envs=1024 wandb.mode=online
+```
+
+Command-line overrides follow the [Hydra](https://hydra.cc/) syntax and can change any key in the config:
+```bash
+# Change number of environments and obstacle counts
+python training/scripts/train.py --config-name=train_depth \
+    headless=True env.num_envs=512 env.num_obstacles=350 env_dyn.num_obstacles=80
+
+# Change depth resolution (must also update sensor params accordingly)
+python training/scripts/train.py --config-name=train_depth \
+    headless=True sensor.depth_height=128 sensor.depth_width=128
+```
+
+#### Encoder options
+The encoder used to process the depth image is selected via `algo.feature_extractor.encoder_type` in `train_depth.yaml` or as a command-line override. The following encoders are available:
+
+| `encoder_type` | Description |
+|---|---|
+| `scratch` | Simple 3-layer strided CNN, trained from scratch (default) |
+| `cnn` | ReachMap CNNOnlyEncoder (no temporal) |
+| `cnn_gru` | ReachMap TemporalCNNEncoder (CNN + GRU) |
+| `cnn_transformer` | ReachMap TemporalTransformerCNNEncoder |
+| `vit` | ReachMap ViTOnlyEncoder (no temporal) |
+| `vit_gru` | ReachMap TemporalViTEncoder (ViT + GRU) |
+| `vit_transformer` | ReachMap TemporalTransformerViTEncoder |
+| `rep_cnn` | Pretrained vitfly ConvNet (RepBaseline) |
+| `rep_cnn_gru` | Pretrained vitfly ConvNet + GRU |
+| `rep_vit` | Pretrained vitfly ViT (RepBaseline) |
+| `rep_vit_gru` | Pretrained vitfly ViT + GRU |
+| `rep_vae` | Pretrained mavrl VAE encoder (RepBaseline) |
+| `rep_vae_gru` | Pretrained mavrl VAE + GRU |
+
+To select an encoder from the command line:
+```bash
+# Train with ReachMap CNN+GRU encoder from scratch
+python training/scripts/train.py --config-name=train_depth \
+    headless=True algo.feature_extractor.encoder_type=cnn_gru
+
+# Load a pretrained ReachMap checkpoint and freeze the encoder
+python training/scripts/train.py --config-name=train_depth \
+    headless=True \
+    algo.feature_extractor.encoder_type=cnn_gru \
+    algo.feature_extractor.encoder_ckpt=/home/hanyujin/ReachMap/checkpoints/cnn_gru_reach+policy/best.pt \
+    algo.feature_extractor.freeze_encoder=true
+```
+
+All encoder options and their parameters are documented in `training/cfg/train_depth.yaml` and `training/cfg/ppo.yaml`.
+
+
 ## II. Deployment Virtual Environment
 This section provides the minimum conda environment setup required to deploy ```NavRL``` (including running on a real robot). If you have already created the  ```NavRL``` conda environment during the [Isaac training step](#I-Training-in-NVIDIA-Isaac-Sim), you can skip this section. To create the conda environment, run the following commands:
 ```

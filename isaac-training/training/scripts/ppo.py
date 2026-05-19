@@ -1,12 +1,174 @@
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pathlib import Path
 from tensordict.tensordict import TensorDict
 from tensordict.nn import TensorDictModuleBase, TensorDictSequential, TensorDictModule
 from einops.layers.torch import Rearrange
 from torchrl.modules import ProbabilisticActor
 from torchrl.envs.transforms import CatTensors
 from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor, vec_to_world
+
+# ---------------------------------------------------------------------------
+# ReachMap encoder integration
+# ---------------------------------------------------------------------------
+
+# Path to ReachMap root: scripts/ → training/ → isaac-training/ → NavRL/ → ReachMap/
+_REACHMAP_ROOT = Path(__file__).resolve().parents[4]
+
+# Depth-input encoder types available from ReachMap (excludes BEV variants)
+_REACHMAP_DEPTH_ENCODERS = [
+    "cnn", "vit",
+    "cnn_gru", "vit_gru",
+    "cnn_transformer", "vit_transformer",
+    "rep_cnn", "rep_cnn_gru", "rep_cnn_transformer",
+    "rep_vit", "rep_vit_gru", "rep_vit_transformer",
+    "rep_vae", "rep_vae_gru", "rep_vae_transformer",
+]
+
+
+def _reachmap_registry() -> dict:
+    """Import ReachMap encoder classes, adding the repo to sys.path if needed."""
+    root = str(_REACHMAP_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from model.encoder import (
+        CNNOnlyEncoder, ViTOnlyEncoder,
+        TemporalCNNEncoder, TemporalViTEncoder,
+        TemporalTransformerCNNEncoder, TemporalTransformerViTEncoder,
+    )
+    from model.rep_encoders import (
+        RepCNNOnlyEncoder,        RepCNNGRUEncoder,        RepCNNTransformerEncoder,
+        RepViTOnlyEncoder,        RepViTGRUEncoder,        RepViTTransformerEncoder,
+        RepVAEOnlyEncoder,        RepVAEGRUEncoder,        RepVAETransformerEncoder,
+    )
+    return {
+        "cnn":                 CNNOnlyEncoder,
+        "vit":                 ViTOnlyEncoder,
+        "cnn_gru":             TemporalCNNEncoder,
+        "vit_gru":             TemporalViTEncoder,
+        "cnn_transformer":     TemporalTransformerCNNEncoder,
+        "vit_transformer":     TemporalTransformerViTEncoder,
+        "rep_cnn":             RepCNNOnlyEncoder,
+        "rep_cnn_gru":         RepCNNGRUEncoder,
+        "rep_cnn_transformer": RepCNNTransformerEncoder,
+        "rep_vit":             RepViTOnlyEncoder,
+        "rep_vit_gru":         RepViTGRUEncoder,
+        "rep_vit_transformer": RepViTTransformerEncoder,
+        "rep_vae":             RepVAEOnlyEncoder,
+        "rep_vae_gru":         RepVAEGRUEncoder,
+        "rep_vae_transformer": RepVAETransformerEncoder,
+    }
+
+
+class ReachMapEncoderWrapper(nn.Module):
+    """
+    Adapts a ReachMap encoder for NavRL's PPO feature extractor.
+
+    ReachMap encoders expect (B, T, H, W) and return (context: B, D), (current: B, D).
+    NavRL feeds (N, 1, H, W) depth images — the channel-1 dim acts as T=1, so no
+    reshape is needed; the encoder interprets it as a single-frame sequence.
+
+    The context vector (temporal summary, or last-frame feature for non-temporal
+    encoders) is projected through a LayerNorm and returned as (N, embed_dim).
+    """
+
+    def __init__(self, encoder: nn.Module, embed_dim: int):
+        super().__init__()
+        self.encoder   = encoder
+        self.embed_dim = embed_dim
+        self.out_norm  = nn.LayerNorm(embed_dim)
+
+    def forward(self, depth: torch.Tensor) -> torch.Tensor:
+        # depth: (N, 1, H, W) — treated as (B=N, T=1, H, W) by ReachMap encoders
+        context, _ = self.encoder(depth)
+        return self.out_norm(context)        # (N, embed_dim)
+
+
+def _load_encoder_ckpt(encoder: nn.Module, ckpt_path: str) -> None:
+    """Load encoder weights from a ReachNet checkpoint (best.pt / latest.pt)."""
+    raw    = torch.load(ckpt_path, map_location="cpu")
+    full_sd = raw.get("state_dict", raw)
+    enc_sd  = {
+        k[len("encoder."):]: v
+        for k, v in full_sd.items()
+        if k.startswith("encoder.")
+    }
+    missing, unexpected = encoder.load_state_dict(enc_sd, strict=False)
+    if missing:
+        print(f"[NavRL] encoder ckpt missing keys: {missing[:5]}")
+    if unexpected:
+        print(f"[NavRL] encoder ckpt unexpected keys: {unexpected[:5]}")
+    print(f"[NavRL] Loaded encoder weights from {ckpt_path}")
+
+
+def build_depth_encoder(cfg) -> nn.Module:
+    """
+    Build the depth-image feature extractor.
+
+    encoder_type = 'scratch'  (default)
+        Simple 3-layer strided CNN trained from scratch.
+
+    encoder_type = '<reachmap_type>'  (e.g. 'cnn_gru', 'vit', 'rep_cnn_gru', ...)
+        ReachMap encoder loaded from cfg.encoder_ckpt if provided (a ReachNet
+        best.pt / latest.pt).  encoder weights are frozen when cfg.freeze_encoder=True.
+
+    All variants return a module: (N, 1, H, W) -> (N, embed_dim).
+    """
+    encoder_type = getattr(cfg, "encoder_type", "scratch")
+    embed_dim    = getattr(cfg, "embed_dim",    256)
+
+    # ── Scratch CNN (default) ─────────────────────────────────────────────────
+    if encoder_type == "scratch":
+        return nn.Sequential(
+            nn.LazyConv2d(out_channels=16, kernel_size=5, stride=2, padding=2), nn.ELU(),
+            nn.LazyConv2d(out_channels=32, kernel_size=3, stride=2, padding=1), nn.ELU(),
+            nn.LazyConv2d(out_channels=64, kernel_size=3, stride=2, padding=1), nn.ELU(),
+            Rearrange("n c h w -> n (c h w)"),
+            nn.LazyLinear(embed_dim), nn.LayerNorm(embed_dim),
+        )
+
+    # ── ReachMap encoder ─────────────────────────────────────────────────────
+    registry = _reachmap_registry()
+    if encoder_type not in registry:
+        raise ValueError(
+            f"Unknown encoder_type '{encoder_type}'. "
+            f"Choose 'scratch' or one of: {_REACHMAP_DEPTH_ENCODERS}"
+        )
+
+    enc_kwargs = dict(
+        embed_dim      = embed_dim,
+        img_h          = getattr(cfg, "img_h",          64),
+        img_w          = getattr(cfg, "img_w",          64),
+        patch_size     = getattr(cfg, "patch_size",      8),
+        vit_depth      = getattr(cfg, "vit_depth",       4),
+        num_heads      = getattr(cfg, "num_heads",        8),
+        num_layers     = getattr(cfg, "gru_layers",       2),
+        gru_layers     = getattr(cfg, "gru_layers",       2),
+        seq_len        = getattr(cfg, "seq_len",         10),
+        temporal_depth = getattr(cfg, "temporal_depth",   2),
+        temporal_heads = getattr(cfg, "temporal_heads",   8),
+        drop           = getattr(cfg, "drop",            0.1),
+        # RepBaseline-specific (ignored by non-rep encoders via **_)
+        ckpt_path       = None,
+        freeze_backbone = False,
+        depth_max_m     = getattr(cfg, "rep_depth_max_m", 4.0),
+        rep_vae_latent  = getattr(cfg, "rep_vae_latent",  64),
+    )
+
+    enc = registry[encoder_type](**enc_kwargs)
+
+    ckpt_path = getattr(cfg, "encoder_ckpt", None)
+    if ckpt_path:
+        _load_encoder_ckpt(enc, ckpt_path)
+
+    if getattr(cfg, "freeze_encoder", False):
+        for p in enc.parameters():
+            p.requires_grad = False
+        print(f"[NavRL] Encoder weights frozen.")
+
+    return ReachMapEncoderWrapper(enc, embed_dim)
 
 
 
@@ -17,15 +179,9 @@ class PPO(TensorDictModuleBase):
         self.device = device
 
         
-        # Feature extractor for LiDAR
-        feature_extractor_network = nn.Sequential(
-            nn.LazyConv2d(out_channels=4, kernel_size=[5, 3], padding=[2, 1]), nn.ELU(), 
-            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 1], padding=[2, 1]), nn.ELU(),
-            nn.LazyConv2d(out_channels=16, kernel_size=[5, 3], stride=[2, 2], padding=[2, 1]), nn.ELU(),
-            Rearrange("n c w h -> n (c w h)"),
-            nn.LazyLinear(128), nn.LayerNorm(128),
-        ).to(self.device)
-        
+        # Depth encoder: scratch CNN or pretrained ReachMap encoder
+        depth_encoder = build_depth_encoder(cfg.feature_extractor).to(self.device)
+
         # Dynamic obstacle information extractor
         dynamic_obstacle_network = nn.Sequential(
             Rearrange("n c w h -> n (c w h)"),
@@ -34,7 +190,7 @@ class PPO(TensorDictModuleBase):
 
         # Feature extractor
         self.feature_extractor = TensorDictSequential(
-            TensorDictModule(feature_extractor_network, [("agents", "observation", "lidar")], ["_cnn_feature"]),
+            TensorDictModule(depth_encoder, [("agents", "observation", "depth")], ["_cnn_feature"]),
             TensorDictModule(dynamic_obstacle_network, [("agents", "observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
             CatTensors(["_cnn_feature", ("agents", "observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False), 
             TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),

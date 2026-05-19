@@ -2,8 +2,8 @@ drone:
   model_name: "hummingbird"
 
 sensor:
-  lidar_range: 4.
-  lidar_vfov: [-10, 20.] # degree
-  lidar_vbeams: 4 # number of vertical beams
-  lidar_hres: 10. # degree
-  
+  depth_range: 4.0          # max sensing range (meters)
+  depth_height: 64          # image height (pixels)
+  depth_width: 64           # image width (pixels)
+  focal_length: 10.0        # ~90 deg horizontal FOV: hfov = 2*atan(aperture/(2*focal_length))
+  horizontal_aperture: 20.955

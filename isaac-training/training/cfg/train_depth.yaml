@@ -1,0 +1,102 @@
+defaults:
+  - _self_
+  - drone       # sensor.depth_range/height/width/focal_length/horizontal_aperture
+  - ppo         # algo settings + feature_extractor encoder options
+  - sim
+
+headless: False
+device: "cuda:0"
+seed: 0
+
+# Total Training Length
+max_frame_num: 12e8
+eval_interval: 1000
+save_interval: 1000
+
+# Training Environment
+env:
+  num_envs: 2             # increase to 1024 for full training (RTX 4090 recommended)
+  max_episode_length: 2200
+  env_spacing: 8.0
+  num_obstacles: 350
+
+env_dyn:
+  num_obstacles: 80       # set to 0 for static-only environment
+  vel_range: [0.5, 1.5]
+  local_range: [5.0, 5.0, 4.5]
+
+viewer:
+  eye: [0., 40., 40.]
+  lookat: [0., 2.5, 0.]
+  resolution: [960, 720]
+
+wandb:
+  project: NavRL-depth
+  name: depth_training
+  entity: CERLAB-UAV-RL-Navigation
+  mode: offline           # set to 'online' to stream to wandb
+  run_id:
+
+# ---------------------------------------------------------------------------
+# Depth camera sensor  (mirrors drone.yaml — set here for visibility)
+# ---------------------------------------------------------------------------
+sensor:
+  depth_range: 4.0        # max sensing range (m); must match algo.feature_extractor.rep_depth_max_m
+  depth_height: 64        # image height (pixels)
+  depth_width: 64         # image width (pixels)
+  focal_length: 10.0      # ~90 deg horizontal FOV: hfov = 2*atan(aperture/(2*focal_length))
+  horizontal_aperture: 20.955
+
+# ---------------------------------------------------------------------------
+# Encoder selection  (overrides ppo.yaml defaults)
+# ---------------------------------------------------------------------------
+# Choose one block below and uncomment it, or pass overrides on the command line.
+
+# ── Option A: Simple CNN trained from scratch (default) ──────────────────────
+algo:
+  feature_extractor:
+    encoder_type: scratch
+    embed_dim: 256
+
+# ── Option B: ReachMap CNN+GRU with pretrained checkpoint ────────────────────
+# algo:
+#   feature_extractor:
+#     encoder_type: cnn_gru
+#     encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/cnn_gru_reach+policy/best.pt
+#     freeze_encoder: false   # true = freeze encoder, train PPO heads only
+#     embed_dim: 256
+#     gru_layers: 2
+
+# ── Option C: ReachMap CNN, no temporal, fine-tuned from scratch ─────────────
+# algo:
+#   feature_extractor:
+#     encoder_type: cnn
+#     embed_dim: 256
+
+# ── Option D: ReachMap ViT, no temporal ──────────────────────────────────────
+# algo:
+#   feature_extractor:
+#     encoder_type: vit
+#     embed_dim: 256
+#     patch_size: 8         # 64/8 = 8 patches per side
+#     vit_depth: 4
+#     num_heads: 8
+
+# ── Option E: ReachMap ViT+GRU ───────────────────────────────────────────────
+# algo:
+#   feature_extractor:
+#     encoder_type: vit_gru
+#     embed_dim: 256
+#     patch_size: 8
+#     vit_depth: 4
+#     num_heads: 8
+#     gru_layers: 2
+
+# ── Option F: Pretrained vitfly RepCNN (RepBaseline) ─────────────────────────
+# algo:
+#   feature_extractor:
+#     encoder_type: rep_cnn
+#     embed_dim: 256
+#     encoder_ckpt: /path/to/reachmap/checkpoints/<run>/best.pt
+#     freeze_encoder: true
+#     rep_depth_max_m: 4.0  # must match sensor.depth_range
