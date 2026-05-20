@@ -432,10 +432,18 @@ class NavigationEnv(IsaacEnv):
         # -----------Network Input I: Depth image-------------------
         # RayCasterCamera output: (num_envs, H, W, 1) → (num_envs, 1, H, W)
         depth_data = self.depth_camera.data.output["distance_to_image_plane"]
+        # RayCasterCamera stores distance_to_image_plane as (N, H, W) — no channel dim
         depth_data = depth_data.nan_to_num(nan=self.depth_range, posinf=self.depth_range)
-        depth_data = depth_data[..., 0].unsqueeze(1).clamp(max=self.depth_range)
-        # Inverted depth: large value = near obstacle (same convention as prior lidar_scan)
+        depth_data = depth_data.unsqueeze(1).clamp(min=0.0, max=self.depth_range)
+
+        # Reward / collision use inverted depth (large = near obstacle); kept separate
+        # from the encoder input so the reward shaping is unaffected.
         self.depth_scan = self.depth_range - depth_data
+
+        # Encoder input: normalize to [0, 1] matching ReachMap training preprocessing
+        #   ReachMap: clip(raw_depth, 0, max_depth) / max_depth  →  [0, 1]
+        # depth_data is already clamped to [0, depth_range], so division is exact.
+        depth_norm = depth_data / self.depth_range
 
         # ---------Network Input II: Drone's internal states---------
         # a. distance info in horizontal and vertical plane
@@ -521,7 +529,7 @@ class NavigationEnv(IsaacEnv):
         # -----------------Network Input Final--------------
         obs = {
             "state": drone_state,
-            "depth": self.depth_scan,
+            "depth": depth_norm,
             "direction": target_dir_2d,
             "dynamic_obstacle": dyn_obs_states
         }

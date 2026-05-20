@@ -3,6 +3,9 @@ algo:
     learning_rate: 5e-4
     dyn_obs_num: 5
 
+    # Observation key for the image input: 'lidar' (default) or 'depth'
+    obs_image_key: lidar
+
     # Depth encoder selection
     # 'scratch'         — simple 3-layer CNN, trained from scratch (default)
     # ReachMap encoders — import from /ReachMap/model/:
@@ -51,8 +54,19 @@ algo:
     drop: 0.1
 
     # RepBaseline backbone settings (used for 'rep_*' types only)
-    rep_depth_max_m: 4.0   # should match sensor.depth_range
+    rep_depth_max_m: 4.0      # must match sensor.depth_range (used to de-normalise [0,1] → metres)
     rep_vae_latent: 64
+    rep_freeze_backbone: true  # freeze RepBaseline backbone weights; train only projection + temporal heads
+
+    # RepBaseline pretrained backbone checkpoint paths.
+    # Each is loaded into the spatial backbone at construction time,
+    # exactly as ReachMap's build_model does via _rep_ckpt_path().
+    #   rep_cnn  →  vitfly ConvNet  (e.g. RepBaseline/vitfly/models/ConvNet_model.pth)
+    #   rep_vit  →  vitfly ViT      (e.g. RepBaseline/vitfly/models/ViT_model.pth)
+    #   rep_vae  →  mavrl VAE       (e.g. RepBaseline/mavrl/exp_vae/vae/best.tar)
+    rep_cnn_ckpt: null
+    rep_vit_ckpt: null
+    rep_vae_ckpt: null
   
   actor:
     learning_rate: 5e-4

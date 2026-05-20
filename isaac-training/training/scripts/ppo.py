@@ -137,6 +137,17 @@ def build_depth_encoder(cfg) -> nn.Module:
             f"Choose 'scratch' or one of: {_REACHMAP_DEPTH_ENCODERS}"
         )
 
+    # For rep_* encoders, resolve the RepBaseline backbone checkpoint path exactly
+    # as ReachMap's build_model does: pick by backbone family (cnn/vit/vae).
+    rep_backbone_ckpt: str | None = None
+    if encoder_type.startswith("rep_"):
+        if "vae" in encoder_type:
+            rep_backbone_ckpt = getattr(cfg, "rep_vae_ckpt", None)
+        elif "vit" in encoder_type:
+            rep_backbone_ckpt = getattr(cfg, "rep_vit_ckpt", None)
+        elif "cnn" in encoder_type:
+            rep_backbone_ckpt = getattr(cfg, "rep_cnn_ckpt", None)
+
     enc_kwargs = dict(
         embed_dim      = embed_dim,
         img_h          = getattr(cfg, "img_h",          64),
@@ -151,17 +162,20 @@ def build_depth_encoder(cfg) -> nn.Module:
         temporal_heads = getattr(cfg, "temporal_heads",   8),
         drop           = getattr(cfg, "drop",            0.1),
         # RepBaseline-specific (ignored by non-rep encoders via **_)
-        ckpt_path       = None,
-        freeze_backbone = False,
-        depth_max_m     = getattr(cfg, "rep_depth_max_m", 4.0),
-        rep_vae_latent  = getattr(cfg, "rep_vae_latent",  64),
+        ckpt_path       = rep_backbone_ckpt,
+        freeze_backbone = getattr(cfg, "rep_freeze_backbone", True),
+        depth_max_m     = getattr(cfg, "rep_depth_max_m",     4.0),
+        rep_vae_latent  = getattr(cfg, "rep_vae_latent",       64),
     )
 
     enc = registry[encoder_type](**enc_kwargs)
 
-    ckpt_path = getattr(cfg, "encoder_ckpt", None)
-    if ckpt_path:
-        _load_encoder_ckpt(enc, ckpt_path)
+    # Optionally load a full ReachNet checkpoint (encoder.* keys) on top.
+    # Works for all encoder types: non-rep encoders trained in ReachMap,
+    # or rep encoders fine-tuned end-to-end via ReachMap.
+    reachnet_ckpt = getattr(cfg, "encoder_ckpt", None)
+    if reachnet_ckpt:
+        _load_encoder_ckpt(enc, reachnet_ckpt)
 
     if getattr(cfg, "freeze_encoder", False):
         for p in enc.parameters():
@@ -188,9 +202,12 @@ class PPO(TensorDictModuleBase):
             make_mlp([128, 64])
         ).to(self.device)
 
+        # Image observation key: 'depth' for depth camera env, 'lidar' for lidar env
+        img_key = getattr(cfg.feature_extractor, "obs_image_key", "lidar")
+
         # Feature extractor
         self.feature_extractor = TensorDictSequential(
-            TensorDictModule(depth_encoder, [("agents", "observation", "depth")], ["_cnn_feature"]),
+            TensorDictModule(depth_encoder, [("agents", "observation", img_key)], ["_cnn_feature"]),
             TensorDictModule(dynamic_obstacle_network, [("agents", "observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
             CatTensors(["_cnn_feature", ("agents", "observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False), 
             TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),

@@ -24,12 +24,14 @@ def main(cfg):
     sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
 
     # Use Wandb to monitor training
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=False)
+    wandb_entity = cfg.wandb.entity if cfg.wandb.entity else None
     if (cfg.wandb.run_id is None):
         run = wandb.init(
             project=cfg.wandb.project,
             name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
-            entity=cfg.wandb.entity,
-            config=cfg,
+            entity=wandb_entity,
+            config=cfg_dict,
             mode=cfg.wandb.mode,
             id=wandb.util.generate_id(),
         )
@@ -37,16 +39,17 @@ def main(cfg):
         run = wandb.init(
             project=cfg.wandb.project,
             name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
-            entity=cfg.wandb.entity,
-            config=cfg,
+            entity=wandb_entity,
+            config=cfg_dict,
             mode=cfg.wandb.mode,
             id=cfg.wandb.run_id,
             resume="must"
         )
 
     # Navigation Training Environment
-    from env import NavigationEnv
-    env = NavigationEnv(cfg)
+    # env_script selects env_lidar (default) or env_depth
+    _env_module = __import__(getattr(cfg, "env_script", "env_lidar"))
+    env = _env_module.NavigationEnv(cfg)
 
     # Transformed Environment
     transforms = []

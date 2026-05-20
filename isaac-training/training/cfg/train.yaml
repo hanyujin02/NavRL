@@ -4,7 +4,7 @@ defaults:
   - ppo
   - sim
 
-headless: False
+headless: True
 device: "cuda:0"
 seed: 0
 
@@ -30,9 +30,16 @@ viewer:
   lookat: [0., 2.5, 0.]
   resolution: [960, 720]
 
+# LiDAR sensor params (overrides drone.yaml sensor block for lidar training)
+sensor:
+  lidar_range: 4.0
+  lidar_vfov: [-10, 20.]   # degrees
+  lidar_vbeams: 4
+  lidar_hres: 10.           # degrees
+
 wandb:
-  project: NavRL
-  name: navigation_training
-  entity: CERLAB-UAV-RL-Navigation
-  mode: offline # online
+  project: NavRL-depth
+  name: navigation_training(lidar)
+  entity: null            # null = use the logged-in user's default entity
+  mode: online # online
   run_id: #kw9xf9k9
