@@ -4,7 +4,7 @@ defaults:
   - ppo
   - sim
 
-headless: False
+headless: True
 device: "cuda:0"
 seed: 0
 
@@ -15,7 +15,7 @@ save_interval: 1000
 
 # Training Environment
 env:
-  num_envs: 2 # Number of drones for training
+  num_envs: 1024 # Number of drones for training
   max_episode_length: 2200
   env_spacing: 8.0 
   num_obstacles: 350
@@ -31,8 +31,8 @@ viewer:
   resolution: [960, 720]
 
 wandb:
-  project: NavRL
-  name: navigation_training
-  entity: CERLAB-UAV-RL-Navigation
-  mode: offline # online
+  project: NavRL-depth
+  name: navigation_training(lidar)
+  entity: null
+  mode: online # online
   run_id: #kw9xf9k9
