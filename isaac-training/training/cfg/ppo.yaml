@@ -1,11 +1,11 @@
 algo:
   feature_extractor:
     learning_rate: 5e-4
-    dyn_obs_num: 5
+    dyn_obs_num: 0
 
     # Observation key for the image input: 'lidar' (default), 'depth', or 'bev'
     # 'bev' is set automatically when encoder_type starts with 'bev_'
-    obs_image_key: lidar
+    obs_image_key: depth
 
     # Depth encoder selection
     # 'scratch'         — simple 3-layer CNN, trained from scratch (default)
@@ -91,15 +91,16 @@ algo:
     bev_patch_size: 10       # ViT patch size for BEV grid (bev_grid_size % bev_patch_size == 0)
 
   actor:
-    learning_rate: 5e-4
+    learning_rate: 1e-4
     clip_ratio: 0.1
-    action_limit: 2.0 # m/s
-  
+    action_limit: 2.0
+
   critic:
-    learning_rate: 5e-4
+    learning_rate: 3e-4
     clip_ratio: 0.1
-  
-  entropy_loss_coefficient: 1e-3 # encourage exploration
-  training_frame_num: 32
-  training_epoch_num: 4
-  num_minibatches: 16 # split into N minibatches
+
+  entropy_loss_coefficient: 5e-3
+
+  training_frame_num: 64
+  training_epoch_num: 2
+  num_minibatches: 8

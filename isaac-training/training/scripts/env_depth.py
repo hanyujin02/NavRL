@@ -1,7 +1,6 @@
 import torch
 import einops
 import numpy as np
-import copy
 import heapq
 from tensordict.tensordict import TensorDict, TensorDictBase
 from torchrl.data import UnboundedContinuousTensorSpec, CompositeSpec, DiscreteTensorSpec
@@ -10,7 +9,6 @@ import omni.isaac.orbit.sim as sim_utils
 from omni_drones.robots.drone import MultirotorBase
 from omni.isaac.orbit.assets import AssetBaseCfg
 from omni.isaac.orbit.terrains import TerrainImporterCfg, TerrainImporter, TerrainGeneratorCfg, HfDiscreteObstaclesTerrainCfg
-from omni.isaac.orbit.terrains.height_field import hf_terrains
 from omni_drones.utils.torch import euler_to_quaternion, quat_axis
 from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, RayCasterCamera, RayCasterCameraCfg, patterns
 from utils import vec_to_new_frame, vec_to_world, construct_input
@@ -178,6 +176,16 @@ class NavigationEnv(IsaacEnv):
             platform_width=0.0,
         )
 
+        # Patch the terrain function BEFORE terrain_cfg is created so the
+        # deep-copy inside TerrainImporterCfg/__post_init__ propagates our wrapper.
+        _orig_fn = self.static_obstacle_cfg.function
+
+        def _capture_terrain(difficulty, cfg):
+            self._terrain_height_field = _orig_fn.__wrapped__(difficulty, cfg).copy()
+            return _orig_fn(difficulty, cfg)
+
+        self.static_obstacle_cfg.function = _capture_terrain
+
         terrain_cfg = TerrainImporterCfg(
             num_envs=self.num_envs,
             env_spacing=0.0,
@@ -185,10 +193,10 @@ class NavigationEnv(IsaacEnv):
             terrain_type="generator",
             terrain_generator=TerrainGeneratorCfg(
                 seed=0,
-                size=(self.map_range[0]*2, self.map_range[1]*2), 
+                size=(self.map_range[0]*2, self.map_range[1]*2),
                 border_width=5.0,
-                num_rows=1, 
-                num_cols=1, 
+                num_rows=1,
+                num_cols=1,
                 horizontal_scale=0.1,
                 vertical_scale=0.1,
                 slope_threshold=0.75,
@@ -204,6 +212,7 @@ class NavigationEnv(IsaacEnv):
             debug_vis=True,
         )
         terrain_importer = TerrainImporter(terrain_cfg)
+        self.static_obstacle_cfg.function = _orig_fn
 
         if (self.cfg.env_dyn.num_obstacles == 0):
             return
@@ -407,22 +416,10 @@ class NavigationEnv(IsaacEnv):
         )
 
     def _build_dijkstra_occupancy(self, inflate_radius: float):
-        obstacle_cfg = copy.deepcopy(self.static_obstacle_cfg)
-        obstacle_cfg.size = (self.map_range[0] * 2.0, self.map_range[1] * 2.0)
-        obstacle_cfg.horizontal_scale = 0.1
-        obstacle_cfg.vertical_scale = 0.1
-        obstacle_cfg.slope_threshold = 0.75
-
-        # Reproduce the single randomly generated terrain used by TerrainGenerator(seed=0)
-        # without perturbing episode-level reset randomization.
-        rng_state = np.random.get_state()
-        try:
-            np.random.seed(0)
-            difficulty = np.random.uniform(0.0, 1.0)
-            height_field = hf_terrains.discrete_obstacles_terrain.__wrapped__(difficulty, obstacle_cfg)
-        finally:
-            np.random.set_state(rng_state)
-        height_m = height_field.astype(np.float32) * obstacle_cfg.vertical_scale
+        # Use the heightfield captured during _design_scene — guaranteed to match
+        # the simulator's obstacle layout regardless of the TerrainGenerator's
+        # internal random call sequence.
+        height_m = self._terrain_height_field.astype(np.float32) * self.static_obstacle_cfg.vertical_scale
         blocked_hi = height_m > float(getattr(self.cfg.env, "dijkstra_obstacle_height", 0.2))
 
         grid_h, grid_w = self.dijkstra_shape
@@ -801,11 +798,8 @@ class NavigationEnv(IsaacEnv):
         depth_data = depth_data.nan_to_num(nan=self.depth_range, posinf=self.depth_range)
         depth_data = depth_data.unsqueeze(1).clamp(min=0.0, max=self.depth_range)
 
-        # Reward / collision use inverted depth (large = near obstacle); kept separate
-        # from the encoder input so the reward shaping is unaffected.
-        self.depth_scan = self.depth_range - depth_data
-
-        # Lidar scan for safety reward — same formula as env_lidar.py
+        # Lidar scan for safety reward and collision — same formula as env_lidar.py
+        # Depth camera is observation-only; reward/collision use LiDAR exclusively.
         self.lidar_scan = self.lidar_range - (
             (self.lidar.data.ray_hits_w - self.lidar.data.pos_w.unsqueeze(1))
             .norm(dim=-1)

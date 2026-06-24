@@ -17,7 +17,7 @@ save_interval: 1000
 
 # Training Environment
 env:
-  num_envs: 128             # increase to 1024 for full training (RTX 4090 recommended)
+  num_envs: 16           # increase to 1024 for full training (RTX 4090 recommended)
   max_episode_length: 2200
   env_spacing: 8.0
   num_obstacles: 350
@@ -98,7 +98,7 @@ algo:
   feature_extractor:
     use_dyn_obs_net: false
     obs_image_key: depth
-    encoder_type: vit
+    encoder_type: scratch
     encoder_ckpt: null
     encoder_ckpt_submodule: ""
     freeze_encoder: false
