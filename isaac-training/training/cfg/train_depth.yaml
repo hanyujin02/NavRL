@@ -47,7 +47,7 @@ viewer:
 
 wandb:
   project: NavRL-depth
-  name: depth_training_vit
+  name: depth_vit_scratch
   entity: null            # null = use the logged-in user's default entity
   mode: online            # set to 'offline' to disable cloud sync
   run_id:
@@ -93,22 +93,22 @@ sensor:
 #     encoder_type: cnn
 #     embed_dim: 256
 
-# ── Option D: ReachMap BEV ViT, no temporal, frozen backbone ─────────────────
+# ── Option D: ReachMap depth ViT, no temporal, trained from scratch ──────────
 algo:
   feature_extractor:
     use_dyn_obs_net: false
-    encoder_type: bev_vit
-    encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/debug-bev-vit-reach-state_20260515_172726/best.pt
-    encoder_ckpt_submodule: spatial  # load encoder.spatial.* only (backbone weights)
-    freeze_encoder: true
+    obs_image_key: depth
+    encoder_type: vit
+    encoder_ckpt: null
+    encoder_ckpt_submodule: ""
+    freeze_encoder: false
     embed_dim: 256
-    bev_grid_size: 50
-    bev_map_range: 4.0
-    bev_height_clip: 2.0
-    bev_no_height_clip: true
-    bev_patch_size: 10
+    img_h: 60
+    img_w: 80
+    patch_size: 10
     vit_depth: 4
     num_heads: 8
+    drop: 0.1
 
 # ── Option E: ReachMap BEV CNN, no temporal, frozen backbone ─────────────────
 # algo:
