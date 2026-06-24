@@ -107,6 +107,7 @@ def main(cfg):
         # Evaluate policy and log info
         if i % cfg.eval_interval == 0:
             print("[NavRL]: start evaluating policy at training step: ", i)
+            torch.cuda.empty_cache()
             env.enable_render(True)
             env.eval()
             eval_info = evaluate(
@@ -134,6 +135,11 @@ def main(cfg):
 
     ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
     torch.save(policy.state_dict(), ckpt_path)
+
+    # Flush collected data to disk (no-op when collect_data: false)
+    if getattr(cfg, "collect_data", False):
+        env.save_data()
+
     wandb.finish()
     sim_app.close()
 

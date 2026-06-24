@@ -1,0 +1,75 @@
+defaults:
+  - train_depth
+  - _self_
+
+# Stage-0 / Stage-1 debug config.
+# Use this to inspect the depth pipeline before running full PPO training.
+
+headless: True
+enable_viewport: false
+seed: 0
+sim_app_experience: ${oc.env:EXP_PATH}/omni.isaac.sim.python.kit
+disable_kit_fs_watcher: true
+skip_sim_app_viewport_wait: true
+kit_extensions: []
+
+max_frame_num: 4096
+eval_interval: 1000000
+save_interval: 1000000
+
+collect_data: false
+
+env:
+  num_envs: 4
+  max_episode_length: 300
+  env_spacing: 8.0
+  num_obstacles: 20
+
+env_dyn:
+  num_obstacles: 0
+  vel_range: [0.5, 1.5]
+  local_range: [5.0, 5.0, 4.5]
+
+wandb:
+  project: NavRL-depth-debug
+  name: depth_stage0_input_check
+  entity: null
+  mode: offline
+  run_id:
+
+sensor:
+  depth_range: 5.0
+  depth_min: 0.1
+  depth_height: 60
+  depth_width: 80
+  focal_length: 10.0
+  horizontal_aperture: 20.955
+  strict_depth_preprocess: true
+  lidar_range: 4.0
+  lidar_vfov: [-10., 20.]
+  lidar_vbeams: 4
+  lidar_hres: 10.
+
+debug_depth:
+  enabled: true
+  save_dir: ./depth_debug_dump
+  save_every: 10
+  print_every: 10
+  max_saves: 50
+  print_stats: true
+
+algo:
+  feature_extractor:
+    # Keep this deliberately simple while validating the input pipeline.
+    use_dyn_obs_net: false
+    encoder_type: scratch
+    obs_image_key: depth
+    seq_len: 1
+    encoder_ckpt: null
+    encoder_ckpt_submodule: ""
+    freeze_encoder: false
+    depth_norm_max_m: 10.0
+    embed_dim: 256
+    img_h: 60
+    img_w: 80
+    use_raycast_aux: false

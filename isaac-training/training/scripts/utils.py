@@ -219,17 +219,17 @@ def vec_to_new_frame(vec, goal_direction):
         vec = vec.unsqueeze(0)
     # print("vec: ", vec.shape)
 
-    # goal direction x
-    goal_direction_x = goal_direction / goal_direction.norm(dim=-1, keepdim=True)
+    # goal direction x (clamp norm to avoid NaN when goal_direction is zero)
+    goal_direction_x = goal_direction / goal_direction.norm(dim=-1, keepdim=True).clamp(min=1e-8)
     z_direction = torch.tensor([0, 0, 1.], device=vec.device)
-    
-    # goal direction y
+
+    # goal direction y (cross product is zero when goal is vertical; clamp to avoid NaN)
     goal_direction_y = torch.cross(z_direction.expand_as(goal_direction_x), goal_direction_x)
-    goal_direction_y /= goal_direction_y.norm(dim=-1, keepdim=True)
-    
+    goal_direction_y /= goal_direction_y.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
     # goal direction z
     goal_direction_z = torch.cross(goal_direction_x, goal_direction_y)
-    goal_direction_z /= goal_direction_z.norm(dim=-1, keepdim=True)
+    goal_direction_z /= goal_direction_z.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
     n = vec.size(0)
     if len(vec.size()) == 3:

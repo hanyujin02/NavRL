@@ -3,7 +3,8 @@ algo:
     learning_rate: 5e-4
     dyn_obs_num: 5
 
-    # Observation key for the image input: 'lidar' (default) or 'depth'
+    # Observation key for the image input: 'lidar' (default), 'depth', or 'bev'
+    # 'bev' is set automatically when encoder_type starts with 'bev_'
     obs_image_key: lidar
 
     # Depth encoder selection
@@ -24,12 +25,25 @@ algo:
     #   'rep_vae'           RepVAEOnlyEncoder     (pretrained mavrl VAE)
     #   'rep_vae_gru'       RepVAEGRUEncoder
     #   'rep_vae_transformer' RepVAETransformerEncoder
+    # BEV encoders — depth back-projected to top-down grid; obs key = 'bev':
+    #   'bev_cnn'           BEVCNNOnlyEncoder
+    #   'bev_vit'           BEVViTOnlyEncoder
+    #   'bev_cnn_gru'       TemporalBEVCNNEncoder
+    #   'bev_vit_gru'       TemporalBEVViTEncoder
+    #   'bev_cnn_transformer' TemporalTransformerBEVCNNEncoder
+    #   'bev_vit_transformer' TemporalTransformerBEVViTEncoder
     encoder_type: scratch
 
     # Path to a ReachMap checkpoint (best.pt / latest.pt) to initialise the
     # encoder weights.  Only used when encoder_type != 'scratch'.
     # The encoder.* sub-keys are extracted automatically; task heads are ignored.
     encoder_ckpt: null
+
+    # Submodule of the encoder to load from the checkpoint.
+    # "" (default) loads all encoder.* keys (full encoder).
+    # "spatial"    loads only encoder.spatial.* keys (backbone only),
+    #              matching ReachMap's freeze_spatial pattern in scripts/train.py.
+    encoder_ckpt_submodule: ""
 
     # Freeze encoder weights after loading checkpoint (fine-tune PPO heads only)
     freeze_encoder: false
@@ -54,7 +68,7 @@ algo:
     drop: 0.1
 
     # RepBaseline backbone settings (used for 'rep_*' types only)
-    rep_depth_max_m: 4.0      # must match sensor.depth_range (used to de-normalise [0,1] → metres)
+    rep_depth_max_m: 5.0      # must match sensor.depth_range (used to de-normalise [0,1] → metres)
     rep_vae_latent: 64
     rep_freeze_backbone: true  # freeze RepBaseline backbone weights; train only projection + temporal heads
 
@@ -67,7 +81,15 @@ algo:
     rep_cnn_ckpt: null
     rep_vit_ckpt: null
     rep_vae_ckpt: null
-  
+
+    # BEV encoder settings (used for 'bev_*' types only)
+    # Depth image is back-projected to a (bev_grid_size × bev_grid_size) top-down grid.
+    # cell_size = bev_map_range / (bev_grid_size / 2) — forward/lateral resolution.
+    bev_grid_size: 50
+    bev_map_range: 5.0       # metres from drone centre to each grid edge
+    bev_height_clip: 2.0     # matches training data collection (habitat.yaml bev_height_clip)
+    bev_patch_size: 10       # ViT patch size for BEV grid (bev_grid_size % bev_patch_size == 0)
+
   actor:
     learning_rate: 5e-4
     clip_ratio: 0.1

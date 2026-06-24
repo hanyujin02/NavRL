@@ -17,7 +17,7 @@ from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch
 # Path to ReachMap root: scripts/ → training/ → isaac-training/ → NavRL/ → ReachMap/
 _REACHMAP_ROOT = Path(__file__).resolve().parents[4]
 
-# Depth-input encoder types available from ReachMap (excludes BEV variants)
+# Encoder types available from ReachMap (depth-input and BEV variants)
 _REACHMAP_DEPTH_ENCODERS = [
     "cnn", "vit",
     "cnn_gru", "vit_gru",
@@ -25,6 +25,9 @@ _REACHMAP_DEPTH_ENCODERS = [
     "rep_cnn", "rep_cnn_gru", "rep_cnn_transformer",
     "rep_vit", "rep_vit_gru", "rep_vit_transformer",
     "rep_vae", "rep_vae_gru", "rep_vae_transformer",
+    "bev_cnn", "bev_vit",
+    "bev_cnn_gru", "bev_vit_gru",
+    "bev_cnn_transformer", "bev_vit_transformer",
 ]
 
 
@@ -43,22 +46,33 @@ def _reachmap_registry() -> dict:
         RepViTOnlyEncoder,        RepViTGRUEncoder,        RepViTTransformerEncoder,
         RepVAEOnlyEncoder,        RepVAEGRUEncoder,        RepVAETransformerEncoder,
     )
+    from model.encoder import (
+        BEVCNNOnlyEncoder,            BEVViTOnlyEncoder,
+        TemporalBEVCNNEncoder,        TemporalBEVViTEncoder,
+        TemporalTransformerBEVCNNEncoder, TemporalTransformerBEVViTEncoder,
+    )
     return {
-        "cnn":                 CNNOnlyEncoder,
-        "vit":                 ViTOnlyEncoder,
-        "cnn_gru":             TemporalCNNEncoder,
-        "vit_gru":             TemporalViTEncoder,
-        "cnn_transformer":     TemporalTransformerCNNEncoder,
-        "vit_transformer":     TemporalTransformerViTEncoder,
-        "rep_cnn":             RepCNNOnlyEncoder,
-        "rep_cnn_gru":         RepCNNGRUEncoder,
-        "rep_cnn_transformer": RepCNNTransformerEncoder,
-        "rep_vit":             RepViTOnlyEncoder,
-        "rep_vit_gru":         RepViTGRUEncoder,
-        "rep_vit_transformer": RepViTTransformerEncoder,
-        "rep_vae":             RepVAEOnlyEncoder,
-        "rep_vae_gru":         RepVAEGRUEncoder,
-        "rep_vae_transformer": RepVAETransformerEncoder,
+        "cnn":                     CNNOnlyEncoder,
+        "vit":                     ViTOnlyEncoder,
+        "cnn_gru":                 TemporalCNNEncoder,
+        "vit_gru":                 TemporalViTEncoder,
+        "cnn_transformer":         TemporalTransformerCNNEncoder,
+        "vit_transformer":         TemporalTransformerViTEncoder,
+        "rep_cnn":                 RepCNNOnlyEncoder,
+        "rep_cnn_gru":             RepCNNGRUEncoder,
+        "rep_cnn_transformer":     RepCNNTransformerEncoder,
+        "rep_vit":                 RepViTOnlyEncoder,
+        "rep_vit_gru":             RepViTGRUEncoder,
+        "rep_vit_transformer":     RepViTTransformerEncoder,
+        "rep_vae":                 RepVAEOnlyEncoder,
+        "rep_vae_gru":             RepVAEGRUEncoder,
+        "rep_vae_transformer":     RepVAETransformerEncoder,
+        "bev_cnn":                 BEVCNNOnlyEncoder,
+        "bev_vit":                 BEVViTOnlyEncoder,
+        "bev_cnn_gru":             TemporalBEVCNNEncoder,
+        "bev_vit_gru":             TemporalBEVViTEncoder,
+        "bev_cnn_transformer":     TemporalTransformerBEVCNNEncoder,
+        "bev_vit_transformer":     TemporalTransformerBEVViTEncoder,
     }
 
 
@@ -74,33 +88,70 @@ class ReachMapEncoderWrapper(nn.Module):
     encoders) is projected through a LayerNorm and returned as (N, embed_dim).
     """
 
-    def __init__(self, encoder: nn.Module, embed_dim: int):
+    def __init__(self, encoder: nn.Module, embed_dim: int, is_bev: bool = False,
+                 freeze_encoder: bool = False):
         super().__init__()
-        self.encoder   = encoder
-        self.embed_dim = embed_dim
-        self.out_norm  = nn.LayerNorm(embed_dim)
+        self.encoder        = encoder
+        self.embed_dim      = embed_dim
+        self.out_norm       = nn.LayerNorm(embed_dim)
+        self.is_bev         = is_bev
+        self._freeze_encoder = freeze_encoder
 
-    def forward(self, depth: torch.Tensor) -> torch.Tensor:
-        # depth: (N, 1, H, W) — treated as (B=N, T=1, H, W) by ReachMap encoders
-        context, _ = self.encoder(depth)
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self._freeze_encoder:
+            self.encoder.eval()   # keep frozen encoder in eval regardless of outer mode
+        return self
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.is_bev:
+            # x: (N, 2, G, G) BEV — add T=1 dim for ReachMap BEV encoders → (N, 1, 2, G, G)
+            x = x.unsqueeze(1)
+        else:
+            # x: (N, 1, H, W) depth — treated as (B=N, T=1, H, W)
+            pass
+        context, _ = self.encoder(x)
         return self.out_norm(context)        # (N, embed_dim)
 
 
-def _load_encoder_ckpt(encoder: nn.Module, ckpt_path: str) -> None:
-    """Load encoder weights from a ReachNet checkpoint (best.pt / latest.pt)."""
-    raw    = torch.load(ckpt_path, map_location="cpu")
+def _load_encoder_ckpt(encoder: nn.Module, ckpt_path: str, submodule: str = "") -> None:
+    """Load encoder weights from a ReachNet checkpoint (best.pt / latest.pt).
+
+    submodule: if non-empty, only load keys under encoder.<submodule>.*
+               (e.g. "spatial" to load the backbone only, matching ReachMap's
+               freeze_spatial pattern in scripts/train.py).
+    """
+    raw     = torch.load(ckpt_path, map_location="cpu")
     full_sd = raw.get("state_dict", raw)
-    enc_sd  = {
+
+    # Strip "encoder." prefix, then optionally restrict to one submodule.
+    # Mirrors ReachMap's `k.startswith("encoder.spatial.")` backbone-only filter.
+    submodule_prefix = f"{submodule}." if submodule else ""
+    enc_sd = {
         k[len("encoder."):]: v
         for k, v in full_sd.items()
-        if k.startswith("encoder.")
+        if k.startswith(f"encoder.{submodule_prefix}")
     }
-    missing, unexpected = encoder.load_state_dict(enc_sd, strict=False)
+
+    # Drop keys whose shapes don't match the current model (e.g. pos_embed when
+    # the checkpoint was trained at a different resolution).  Those params are
+    # left at their randomly-initialised values.
+    model_sd = encoder.state_dict()
+    skipped, filtered = [], {}
+    for k, v in enc_sd.items():
+        if k in model_sd and model_sd[k].shape != v.shape:
+            skipped.append(f"{k}: ckpt {tuple(v.shape)} vs model {tuple(model_sd[k].shape)}")
+        else:
+            filtered[k] = v
+    if skipped:
+        print(f"[NavRL] encoder ckpt skipped (shape mismatch): {skipped}")
+    missing, unexpected = encoder.load_state_dict(filtered, strict=False)
     if missing:
         print(f"[NavRL] encoder ckpt missing keys: {missing[:5]}")
     if unexpected:
         print(f"[NavRL] encoder ckpt unexpected keys: {unexpected[:5]}")
-    print(f"[NavRL] Loaded encoder weights from {ckpt_path}")
+    sub_desc = f" (submodule: {submodule})" if submodule else ""
+    print(f"[NavRL] Loaded encoder weights{sub_desc} from {ckpt_path}")
 
 
 def build_depth_encoder(cfg) -> nn.Module:
@@ -148,25 +199,42 @@ def build_depth_encoder(cfg) -> nn.Module:
         elif "cnn" in encoder_type:
             rep_backbone_ckpt = getattr(cfg, "rep_cnn_ckpt", None)
 
-    enc_kwargs = dict(
-        embed_dim      = embed_dim,
-        img_h          = getattr(cfg, "img_h",          64),
-        img_w          = getattr(cfg, "img_w",          64),
-        patch_size     = getattr(cfg, "patch_size",      8),
-        vit_depth      = getattr(cfg, "vit_depth",       4),
-        num_heads      = getattr(cfg, "num_heads",        8),
-        num_layers     = getattr(cfg, "gru_layers",       2),
-        gru_layers     = getattr(cfg, "gru_layers",       2),
-        seq_len        = getattr(cfg, "seq_len",         10),
-        temporal_depth = getattr(cfg, "temporal_depth",   2),
-        temporal_heads = getattr(cfg, "temporal_heads",   8),
-        drop           = getattr(cfg, "drop",            0.1),
-        # RepBaseline-specific (ignored by non-rep encoders via **_)
-        ckpt_path       = rep_backbone_ckpt,
-        freeze_backbone = getattr(cfg, "rep_freeze_backbone", True),
-        depth_max_m     = getattr(cfg, "rep_depth_max_m",     4.0),
-        rep_vae_latent  = getattr(cfg, "rep_vae_latent",       64),
-    )
+    is_bev = encoder_type.startswith("bev_")
+
+    if is_bev:
+        enc_kwargs = dict(
+            embed_dim      = embed_dim,
+            grid_size      = getattr(cfg, "bev_grid_size",    50),
+            bev_patch_size = getattr(cfg, "bev_patch_size",   10),
+            vit_depth      = getattr(cfg, "vit_depth",         4),
+            num_heads      = getattr(cfg, "num_heads",          8),
+            num_layers     = getattr(cfg, "gru_layers",         2),
+            gru_layers     = getattr(cfg, "gru_layers",         2),
+            seq_len        = getattr(cfg, "seq_len",           10),
+            temporal_depth = getattr(cfg, "temporal_depth",     2),
+            temporal_heads = getattr(cfg, "temporal_heads",     8),
+            drop           = getattr(cfg, "drop",             0.1),
+        )
+    else:
+        enc_kwargs = dict(
+            embed_dim      = embed_dim,
+            img_h          = getattr(cfg, "img_h",          64),
+            img_w          = getattr(cfg, "img_w",          64),
+            patch_size     = getattr(cfg, "patch_size",      8),
+            vit_depth      = getattr(cfg, "vit_depth",       4),
+            num_heads      = getattr(cfg, "num_heads",        8),
+            num_layers     = getattr(cfg, "gru_layers",       2),
+            gru_layers     = getattr(cfg, "gru_layers",       2),
+            seq_len        = getattr(cfg, "seq_len",         10),
+            temporal_depth = getattr(cfg, "temporal_depth",   2),
+            temporal_heads = getattr(cfg, "temporal_heads",   8),
+            drop           = getattr(cfg, "drop",            0.1),
+            # RepBaseline-specific (ignored by non-rep encoders via **_)
+            ckpt_path       = rep_backbone_ckpt,
+            freeze_backbone = getattr(cfg, "rep_freeze_backbone", True),
+            depth_max_m     = getattr(cfg, "rep_depth_max_m",     5.0),
+            rep_vae_latent  = getattr(cfg, "rep_vae_latent",       64),
+        )
 
     enc = registry[encoder_type](**enc_kwargs)
 
@@ -175,14 +243,16 @@ def build_depth_encoder(cfg) -> nn.Module:
     # or rep encoders fine-tuned end-to-end via ReachMap.
     reachnet_ckpt = getattr(cfg, "encoder_ckpt", None)
     if reachnet_ckpt:
-        _load_encoder_ckpt(enc, reachnet_ckpt)
+        submodule = getattr(cfg, "encoder_ckpt_submodule", "")
+        _load_encoder_ckpt(enc, reachnet_ckpt, submodule=submodule)
 
-    if getattr(cfg, "freeze_encoder", False):
+    freeze = getattr(cfg, "freeze_encoder", False)
+    if freeze:
         for p in enc.parameters():
             p.requires_grad = False
         print(f"[NavRL] Encoder weights frozen.")
 
-    return ReachMapEncoderWrapper(enc, embed_dim)
+    return ReachMapEncoderWrapper(enc, embed_dim, is_bev=is_bev, freeze_encoder=freeze)
 
 
 
@@ -196,22 +266,33 @@ class PPO(TensorDictModuleBase):
         # Depth encoder: scratch CNN or pretrained ReachMap encoder
         depth_encoder = build_depth_encoder(cfg.feature_extractor).to(self.device)
 
-        # Dynamic obstacle information extractor
-        dynamic_obstacle_network = nn.Sequential(
-            Rearrange("n c w h -> n (c w h)"),
-            make_mlp([128, 64])
-        ).to(self.device)
+        # Image observation key:
+        #   bev_* encoders always use "bev" (env_depth sets this key when use_bev=True)
+        #   all others use obs_image_key from config ("depth" for depth env, "lidar" for lidar env)
+        _enc_type = getattr(cfg.feature_extractor, "encoder_type", "scratch")
+        if _enc_type.startswith("bev_"):
+            img_key = "bev"
+        else:
+            img_key = getattr(cfg.feature_extractor, "obs_image_key", "lidar")
+        use_dyn_obs_net = getattr(cfg.feature_extractor, "use_dyn_obs_net", True)
 
-        # Image observation key: 'depth' for depth camera env, 'lidar' for lidar env
-        img_key = getattr(cfg.feature_extractor, "obs_image_key", "lidar")
-
-        # Feature extractor
-        self.feature_extractor = TensorDictSequential(
-            TensorDictModule(depth_encoder, [("agents", "observation", img_key)], ["_cnn_feature"]),
-            TensorDictModule(dynamic_obstacle_network, [("agents", "observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
-            CatTensors(["_cnn_feature", ("agents", "observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False), 
-            TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
-        ).to(self.device)
+        if use_dyn_obs_net:
+            dynamic_obstacle_network = nn.Sequential(
+                Rearrange("n c w h -> n (c w h)"),
+                make_mlp([128, 64])
+            ).to(self.device)
+            self.feature_extractor = TensorDictSequential(
+                TensorDictModule(depth_encoder, [("agents", "observation", img_key)], ["_cnn_feature"]),
+                TensorDictModule(dynamic_obstacle_network, [("agents", "observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
+                CatTensors(["_cnn_feature", ("agents", "observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False),
+                TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
+            ).to(self.device)
+        else:
+            self.feature_extractor = TensorDictSequential(
+                TensorDictModule(depth_encoder, [("agents", "observation", img_key)], ["_cnn_feature"]),
+                CatTensors(["_cnn_feature", ("agents", "observation", "state")], "_feature", del_keys=False),
+                TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
+            ).to(self.device)
 
         # Actor etwork
         self.n_agents, self.action_dim = action_spec.shape
@@ -268,22 +349,48 @@ class PPO(TensorDictModuleBase):
         # tensordict: (num_env, num_frames, dim), batchsize = num_env * num_frames
         next_tensordict = tensordict["next"]
         with torch.no_grad():
+            self.feature_extractor.eval()
             next_tensordict = torch.vmap(self.feature_extractor)(next_tensordict) # calculate features for next state value calculation
+            self.feature_extractor.train()
             next_values = self.critic(next_tensordict)["state_value"]
         rewards = tensordict["next", "agents", "reward"] # Reward obtained by state transition
         dones = tensordict["next", "terminated"] # Whether the next states are terminal states
 
+        # Sanitize rewards and values: a physics crash on the final step before reset can
+        # leave NaN in one transition; replace with 0 so GAE and ValueNorm stay clean.
+        rewards = rewards.nan_to_num(0.0)
+
+        # Sanitize stored state_value (b_value): if the critic produced NaN during
+        # collection (e.g., NaN observation escaped env sanitization), b_value in
+        # _update would be NaN → critic_loss NaN. Replace with 0.
+        raw_state_val = tensordict["state_value"]
+        if torch.isnan(raw_state_val).any():
+            n_nan = torch.isnan(raw_state_val).sum().item()
+            print(f"[NavRL] {n_nan}/{raw_state_val.numel()} NaN state_values in buffer — sanitizing")
+            tensordict["state_value"] = raw_state_val.nan_to_num(0.0)
+
         values = tensordict["state_value"] # This is calculated stored when we called forward to obtain actions
         values = self.value_norm.denormalize(values) # denomalize values based on running mean and var of return
         next_values = self.value_norm.denormalize(next_values)
+        values = values.nan_to_num(0.0)
+        next_values = next_values.nan_to_num(0.0)
 
         # calculate GAE: Generalized Advantage Estimation
         adv, ret = self.gae(rewards, dones, values, next_values)
         adv_mean = adv.mean()
         adv_std = adv.std()
         adv = (adv - adv_mean) / adv_std.clip(1e-7)
+        # ValueNorm running stats become permanently NaN once corrupted (EMA: NaN*β + …=NaN).
+        # Detect and reset before the update so future batches are not poisoned.
+        if (torch.isnan(self.value_norm.running_mean).any()
+                or torch.isnan(self.value_norm.running_mean_sq).any()
+                or torch.isnan(self.value_norm.debiasing_term).any()):
+            print("[NavRL] ValueNorm running stats corrupted (NaN) — resetting")
+            self.value_norm.reset_parameters()
+
         self.value_norm.update(ret) # update running mean and var for return
         ret = self.value_norm.normalize(ret)  # normalize return
+        ret = ret.nan_to_num(0.0)  # guard: normalize() can return NaN if stats were just reset
         tensordict.set("adv", adv)
         tensordict.set("ret", ret)
 
@@ -312,10 +419,14 @@ class PPO(TensorDictModuleBase):
 
         # Actor Loss
         advantage = tensordict["adv"] # the advantage is calculated based on GAE in hte previous step
-        ratio = torch.exp(log_probs - tensordict["sample_log_prob"]).unsqueeze(-1)
+        # If action_normalized hit a Beta boundary (0 or 1), log_prob = -inf.
+        # -inf - (-inf) = NaN; nan_to_num(0) → ratio=1 (neutral, skip that transition).
+        # Then clamp to guard against large-but-finite divergence.
+        log_ratio = (log_probs - tensordict["sample_log_prob"]).nan_to_num(0.0).clamp(-20.0, 20.0)
+        ratio = torch.exp(log_ratio).unsqueeze(-1)
         surr1 = advantage * ratio
         surr2 = advantage * ratio.clamp(1.-self.cfg.actor.clip_ratio, 1.+self.cfg.actor.clip_ratio)
-        actor_loss = -torch.mean(torch.min(surr1, surr2)) * self.action_dim 
+        actor_loss = -torch.mean(torch.min(surr1, surr2)) * self.action_dim
 
         # Critic Loss 
         b_value = tensordict["state_value"]
@@ -335,12 +446,26 @@ class PPO(TensorDictModuleBase):
         self.critic_optim.zero_grad()
         loss.backward()
 
+        # Skip update if loss is NaN/Inf (e.g., caused by a bad batch)
+        if not torch.isfinite(loss).item():
+            _dev = loss.device
+            print(f"[NavRL] NaN/Inf loss at update step, skipping optimizer (actor={actor_loss.item():.4f}, critic={critic_loss.item():.4f}, entropy={entropy_loss.item():.4f})")
+            return TensorDict({
+                "actor_loss": actor_loss.detach(),
+                "critic_loss": critic_loss.detach(),
+                "entropy": entropy_loss.detach(),
+                "actor_grad_norm": torch.tensor(float("nan"), device=_dev),
+                "critic_grad_norm": torch.tensor(float("nan"), device=_dev),
+                "explained_var": torch.tensor(float("nan"), device=_dev),
+            }, [])
+
         actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.) # to prevent gradient growing too large
         critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.critic.parameters(), max_norm=5.)
+        nn.utils.clip_grad.clip_grad_norm_(self.feature_extractor.parameters(), max_norm=5.)
         self.feature_extractor_optim.step()
         self.actor_optim.step()
         self.critic_optim.step()
-        explained_var = 1 - F.mse_loss(value, ret) / ret.var()
+        explained_var = 1 - F.mse_loss(value, ret) / ret.var().clamp(min=1e-8)
         return TensorDict({
             "actor_loss": actor_loss,
             "critic_loss": critic_loss,

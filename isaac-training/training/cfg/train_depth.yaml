@@ -1,8 +1,8 @@
 defaults:
-  - _self_
   - drone       # sensor.depth_range/height/width/focal_length/horizontal_aperture
   - ppo         # algo settings + feature_extractor encoder options
   - sim
+  - _self_      # train_depth.yaml overrides take highest priority
 
 env_script: env_depth   # selects training/scripts/env_depth.py
 
@@ -17,13 +17,26 @@ save_interval: 1000
 
 # Training Environment
 env:
-  num_envs: 2             # increase to 1024 for full training (RTX 4090 recommended)
+  num_envs: 128             # increase to 1024 for full training (RTX 4090 recommended)
   max_episode_length: 2200
   env_spacing: 8.0
   num_obstacles: 350
+  use_dijkstra_reward: true
+  dijkstra_map_extent: 24.0       # covers randomized start/goal sides; terrain obstacles remain within map_range
+  dijkstra_grid_resolution: 0.4   # metres/cell for the training-time potential map
+  dijkstra_obstacle_height: 0.2   # cells above this terrain height are treated as blocked
+  dijkstra_inflate_radius: 0.3    # metres of obstacle inflation for the potential map
+  dijkstra_reward_scale: 1.0
+  dijkstra_reward_clip: 2.0
+  use_cbf_safety_reward: true
+  cbf_obstacle_inflate_radius: 0.0 # keep raw obstacle geometry; cbf_safe_margin defines safety buffer
+  cbf_safe_margin: 0.6            # h = distance_to_obstacle - margin
+  cbf_gamma: 2.0                  # forward-invariance condition: h_dot + gamma * h >= 0
+  cbf_reward_scale: 1.0
+  cbf_reward_clip: 5.0
 
 env_dyn:
-  num_obstacles: 80       # set to 0 for static-only environment
+  num_obstacles: 0       # set to 0 for static-only environment
   vel_range: [0.5, 1.5]
   local_range: [5.0, 5.0, 4.5]
 
@@ -48,6 +61,11 @@ sensor:
   depth_width: 80         # image width (pixels)
   focal_length: 10.0      # ~90 deg horizontal FOV: hfov = 2*atan(aperture/(2*focal_length))
   horizontal_aperture: 20.955
+  # LiDAR for safety reward (mirrors train.yaml / env_lidar.py defaults)
+  lidar_range: 4.0
+  lidar_vfov: [-10., 20.]   # degrees
+  lidar_vbeams: 4
+  lidar_hres: 10.            # degrees → 36 horizontal beams
 
 # ---------------------------------------------------------------------------
 # Encoder selection  (overrides ppo.yaml defaults)
@@ -75,26 +93,35 @@ sensor:
 #     encoder_type: cnn
 #     embed_dim: 256
 
-# ── Option D: ReachMap ViT, no temporal ──────────────────────────────────────
+# ── Option D: ReachMap BEV ViT, no temporal, frozen backbone ─────────────────
 algo:
   feature_extractor:
-    obs_image_key: depth   # depth env provides 'depth', lidar env provides 'lidar'
-    encoder_type: vit
-    encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/debug-bev-vit-reach-state_20260515_172726/latest.pt
+    use_dyn_obs_net: false
+    encoder_type: bev_vit
+    encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/debug-bev-vit-reach-state_20260515_172726/best.pt
+    encoder_ckpt_submodule: spatial  # load encoder.spatial.* only (backbone weights)
+    freeze_encoder: true
     embed_dim: 256
-    patch_size: 10         # 64/8 = 8 patches per side
+    bev_grid_size: 50
+    bev_map_range: 4.0
+    bev_height_clip: 2.0
+    bev_no_height_clip: true
+    bev_patch_size: 10
     vit_depth: 4
     num_heads: 8
 
-# ── Option E: ReachMap ViT+GRU ───────────────────────────────────────────────
+# ── Option E: ReachMap BEV CNN, no temporal, frozen backbone ─────────────────
 # algo:
 #   feature_extractor:
-#     encoder_type: vit_gru
+#     use_dyn_obs_net: false
+#     encoder_type: bev_cnn
+#     encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/debug-bev-cnn-reach-state_20260516_021556/best.pt
+#     encoder_ckpt_submodule: spatial  # load encoder.spatial.* only (backbone weights)
+#     freeze_encoder: true
 #     embed_dim: 256
-#     patch_size: 8
-#     vit_depth: 4
-#     num_heads: 8
-#     gru_layers: 2
+#     bev_grid_size: 50
+#     bev_map_range: 5.0
+#     bev_height_clip: 2.0
 
 # ── Option F: Pretrained vitfly RepCNN (RepBaseline) ─────────────────────────
 # algo:
