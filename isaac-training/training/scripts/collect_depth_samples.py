@@ -11,6 +11,7 @@ import os
 import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
+import isaacsim  # must come before omni.isaac.kit on Isaac Sim 4.x
 from omni.isaac.kit import SimulationApp
 
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")

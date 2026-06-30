@@ -1,6 +1,7 @@
 import rospy
 import numpy as np
 import torch
+from sensor_msgs.msg import Image
 from map_manager.srv import RayCast
 from nav_msgs.msg import Odometry, Path
 from visualization_msgs.msg import Marker, MarkerArray
@@ -29,6 +30,22 @@ class Navigation:
         self.lidar_hbeams = int(360/self.cfg.sensor.lidar_hres)
         self.raypoints = []
         self.dynamic_obstacles = []
+
+        # Depth camera
+        self.depth_height = cfg.sensor.depth_height
+        self.depth_width = cfg.sensor.depth_width
+        self.depth_range = cfg.sensor.depth_range
+        self.depth_image = None
+        self.depth_received = False
+        try:
+            from cv_bridge import CvBridge
+            self._cv_bridge = CvBridge()
+        except ImportError:
+            self._cv_bridge = None
+            rospy.logwarn("[navRunner]: cv_bridge not found — depth images will not be processed.")
+        depth_topic = rospy.get_param('~depth_topic', '/camera/depth/image_raw')
+        rospy.loginfo(f"[navRunner]: Depth topic: {depth_topic}.")
+        rospy.Subscriber(depth_topic, Image, self.depth_callback)
         self.robot_size = 0.3 # radius
         self.raycast_vres = ((self.cfg.sensor.lidar_vfov[1] - self.cfg.sensor.lidar_vfov[0]))/(self.cfg.sensor.lidar_vbeams - 1) * np.pi/180.0
         self.raycast_hres = self.cfg.sensor.lidar_hres * np.pi/180.0
@@ -90,7 +107,7 @@ class Navigation:
             "agents": CompositeSpec({
                 "observation": CompositeSpec({
                     "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.cfg.device), 
-                    "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.cfg.sensor.lidar_vbeams), device=self.cfg.device),
+                    "depth": UnboundedContinuousTensorSpec((1, self.depth_height, self.depth_width), device=self.cfg.device),
                     "direction": UnboundedContinuousTensorSpec((1, 3), device=self.cfg.device),
                     "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.cfg.device),
                 }),
@@ -246,6 +263,22 @@ class Navigation:
         dynamic_obstacle_pos, dynamic_obstacle_vel, dynamic_obstacle_size = self.get_dynamic_obstacles(pos)
         self.dynamic_obstacles = (dynamic_obstacle_pos, dynamic_obstacle_vel, dynamic_obstacle_size)
 
+    def depth_callback(self, msg):
+        if self._cv_bridge is None:
+            return
+        import cv2
+        if msg.encoding in ('32FC1', '32FC'):
+            depth_np = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding='32FC1')
+        else:  # 16UC1 — millimetres
+            depth_np = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding='16UC1').astype(np.float32) / 1000.0
+        if depth_np.shape != (self.depth_height, self.depth_width):
+            depth_np = cv2.resize(depth_np, (self.depth_width, self.depth_height),
+                                  interpolation=cv2.INTER_NEAREST)
+        depth_np = np.clip(depth_np, 0.0, self.depth_range)
+        depth_t = torch.tensor(depth_np, dtype=torch.float32, device=self.cfg.device)
+        self.depth_image = (depth_t / self.depth_range).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        self.depth_received = True
+
     def odom_callback(self, odom):
         self.odom = odom
         self.odom_received = True
@@ -376,6 +409,7 @@ class Navigation:
         drone_state = torch.cat([rpos_clipped_g, distance_2d, distance_z, vel_g], dim=-1).unsqueeze(0)
 
         # Lidar States
+        # LiDAR scan (kept for safety gate and safe_action service; not fed to policy)
         lidar_scan = torch.tensor(self.raypoints, device=self.cfg.device)
         lidar_scan = (lidar_scan - pos).norm(dim=-1).clamp_max(self.cfg.sensor.lidar_range).reshape(1, 1, self.lidar_hbeams, self.cfg.sensor.lidar_vbeams)
         lidar_scan = self.cfg.sensor.lidar_range - lidar_scan
@@ -415,7 +449,7 @@ class Navigation:
             "agents": TensorDict({
                 "observation": TensorDict({
                     "state": drone_state,
-                    "lidar": lidar_scan,
+                    "depth": self.depth_image,  # (1, 1, H, W) normalized [0,1]
                     "direction": target_dir_2d,
                     "dynamic_obstacle": dyn_obs_states
                 })
@@ -435,8 +469,8 @@ class Navigation:
 
                     response = get_policy_inference(obs["agents"]["observation"]["state"].cpu().numpy().flatten().tolist(),
                                                     obs["agents"]["observation"]["state"].size(),
-                                                    obs["agents"]["observation"]["lidar"].cpu().numpy().flatten().tolist(),
-                                                    obs["agents"]["observation"]["lidar"].size(), 
+                                                    obs["agents"]["observation"]["depth"].cpu().numpy().flatten().tolist(),
+                                                    obs["agents"]["observation"]["depth"].size(),
                                                     obs["agents"]["observation"]["direction"].cpu().numpy().flatten().tolist(),
                                                     obs["agents"]["observation"]["direction"].size(),
                                                     obs["agents"]["observation"]["dynamic_obstacle"].cpu().numpy().flatten().tolist(),
@@ -465,7 +499,7 @@ class Navigation:
         if (not self.odom_received):
             return
 
-        if (not self.goal_received or len(self.raypoints) == 0 or len(self.dynamic_obstacles) == 0):
+        if (not self.goal_received or len(self.raypoints) == 0 or len(self.dynamic_obstacles) == 0 or not self.depth_received):
             self.pose_pub.publish(self.takeoff_pose)
             return
 

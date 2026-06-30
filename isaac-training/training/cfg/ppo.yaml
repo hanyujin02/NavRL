@@ -1,7 +1,8 @@
 algo:
   feature_extractor:
-    learning_rate: 5e-4
+    learning_rate: 1e-4
     dyn_obs_num: 0
+    aux_loss_coeff: 0   # weight for FOV LiDAR aux supervision loss (0 = disabled)
 
     # Observation key for the image input: 'lidar' (default), 'depth', or 'bev'
     # 'bev' is set automatically when encoder_type starts with 'bev_'
@@ -91,15 +92,15 @@ algo:
     bev_patch_size: 10       # ViT patch size for BEV grid (bev_grid_size % bev_patch_size == 0)
 
   actor:
-    learning_rate: 1e-4
-    clip_ratio: 0.1
+    learning_rate: 5e-5
+    clip_ratio: 0.2
     action_limit: 2.0
 
   critic:
     learning_rate: 3e-4
-    clip_ratio: 0.1
+    clip_ratio: 0.2
 
-  entropy_loss_coefficient: 5e-3
+  entropy_loss_coefficient: 1e-2
 
   training_frame_num: 64
   training_epoch_num: 2

@@ -5,6 +5,7 @@ import datetime
 import wandb
 import torch
 from omegaconf import DictConfig, OmegaConf
+import isaacsim  # must come before omni.isaac.kit on Isaac Sim 4.x
 from omni.isaac.kit import SimulationApp
 from ppo import PPO
 from omni_drones.controllers import LeePositionController
@@ -62,9 +63,9 @@ def main(cfg):
     # PPO Policy
     policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
 
-    # checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_2500.pt"
-    # checkpoint = "/home/xinmingh/RLDrones/navigation/scripts/nav-ros/navigation_runner/ckpts/checkpoint_36000.pt"
-    # policy.load_state_dict(torch.load(checkpoint))
+    if getattr(cfg, "checkpoint", None):
+        policy.load_state_dict(torch.load(cfg.checkpoint, map_location=cfg.device))
+        print(f"[NavRL]: resumed from checkpoint: {cfg.checkpoint}")
     
     # Episode Stats Collector
     episode_stats_keys = [
@@ -111,15 +112,16 @@ def main(cfg):
             env.enable_render(True)
             env.eval()
             eval_info = evaluate(
-                env=transformed_env, 
+                env=transformed_env,
                 policy=policy,
-                seed=cfg.seed, 
+                seed=cfg.seed,
                 cfg=cfg,
                 exploration_type=ExplorationType.MEAN
             )
             env.enable_render(not cfg.headless)
             env.train()
             env.reset()
+            torch.cuda.empty_cache()
             info.update(eval_info)
             print("\n[NavRL]: evaluation done.")
         

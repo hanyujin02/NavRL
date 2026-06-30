@@ -370,8 +370,13 @@ class IsaacEnv(EnvBase):
                 )
             # obtain the rgb data
             rgb_data = self._rgb_annotator.get_data()
-            # convert to numpy array
-            rgb_data = np.frombuffer(rgb_data, dtype=np.uint8).reshape(*rgb_data.shape)
+            # Isaac Sim 4.x returns a flat 1-D numpy array; older versions return
+            # a buffer-like object with a multi-dimensional shape attribute.
+            if isinstance(rgb_data, np.ndarray) and rgb_data.ndim == 1:
+                w, h = self.cfg.viewer.resolution  # (width, height)
+                rgb_data = rgb_data.reshape(h, w, -1)
+            else:
+                rgb_data = np.frombuffer(rgb_data, dtype=np.uint8).reshape(*rgb_data.shape)
             # return the rgb data
             return rgb_data[:, :, :3]
         else:

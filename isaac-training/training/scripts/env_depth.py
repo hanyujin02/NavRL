@@ -38,6 +38,17 @@ class NavigationEnv(IsaacEnv):
         self.depth_height = cfg.sensor.depth_height
         self.depth_width = cfg.sensor.depth_width
 
+        # FOV mask — must be computed before super().__init__() because _set_specs() uses it
+        import math
+        hfov_half_deg = math.degrees(
+            math.atan2(cfg.sensor.horizontal_aperture / 2.0, cfg.sensor.focal_length)
+        )
+        lidar_hbeams = int(360 / cfg.sensor.lidar_hres)
+        h_angles = torch.arange(0, 360, cfg.sensor.lidar_hres, dtype=torch.float32)
+        h_angles_signed = ((h_angles + 180.0) % 360.0) - 180.0
+        self._lidar_fov_mask_h = h_angles_signed.abs() <= hfov_half_deg  # (lidar_hbeams,)
+        self._lidar_fov_num_rays = int(self._lidar_fov_mask_h.sum().item()) * cfg.sensor.lidar_vbeams
+
         # BEV mode: back-project depth to top-down grid for bev_* encoders
         _enc_type = getattr(cfg.algo.feature_extractor, "encoder_type", "scratch")
         self.use_bev = _enc_type.startswith("bev_")
@@ -90,6 +101,7 @@ class NavigationEnv(IsaacEnv):
         lidar_vbeams = cfg.sensor.lidar_vbeams
         lidar_hbeams = int(360 / cfg.sensor.lidar_hres)
         self.lidar_resolution = (lidar_hbeams, lidar_vbeams)
+
         ray_caster_cfg = RayCasterCfg(
             prim_path="/World/envs/env_.*/Hummingbird_0/base_link",
             offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
@@ -475,36 +487,40 @@ class NavigationEnv(IsaacEnv):
         return sx, sy
 
     def _compute_dijkstra_field_np(self, target_xy):
+        from scipy.sparse.csgraph import dijkstra as scipy_dijkstra
         grid_h, grid_w = self.dijkstra_shape
         target_idx = self._world_xy_to_dijkstra_index_np(target_xy.reshape(1, 2))
         tx, ty = self._nearest_free_dijkstra_cell((int(target_idx[0][0]), int(target_idx[1][0])))
 
-        dist = np.full((grid_h, grid_w), np.inf, dtype=np.float32)
-        dist[tx, ty] = 0.0
-        heap = [(0.0, tx, ty)]
+        # Build sparse adjacency graph (once could be cached, but occupancy is static so fine here)
+        n = grid_h * grid_w
+        free = ~self.dijkstra_occupancy  # (H, W) bool
+        rows, cols, weights = [], [], []
         neighbors = (
             (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
             (-1, -1, np.sqrt(2.0)), (-1, 1, np.sqrt(2.0)), (1, -1, np.sqrt(2.0)), (1, 1, np.sqrt(2.0)),
         )
-        while heap:
-            curr, x, y = heapq.heappop(heap)
-            if curr != dist[x, y]:
-                continue
-            for dx, dy, step in neighbors:
-                nx, ny = x + dx, y + dy
-                if nx < 0 or nx >= grid_h or ny < 0 or ny >= grid_w or self.dijkstra_occupancy[nx, ny]:
-                    continue
-                new_dist = curr + step * self.dijkstra_grid_resolution
-                if new_dist < dist[nx, ny]:
-                    dist[nx, ny] = new_dist
-                    heapq.heappush(heap, (new_dist, nx, ny))
+        xs, ys = np.where(free)
+        for dx, dy, w in neighbors:
+            nx_, ny_ = xs + dx, ys + dy
+            valid = (nx_ >= 0) & (nx_ < grid_h) & (ny_ >= 0) & (ny_ < grid_w) & free[nx_.clip(0, grid_h-1), ny_.clip(0, grid_w-1)]
+            src = xs[valid] * grid_w + ys[valid]
+            dst = nx_[valid] * grid_w + ny_[valid]
+            rows.extend(src); cols.extend(dst)
+            weights.extend([w * self.dijkstra_grid_resolution] * int(valid.sum()))
+
+        from scipy.sparse import csr_matrix
+        graph = csr_matrix((weights, (rows, cols)), shape=(n, n))
+        target_node = tx * grid_w + ty
+        dist_flat = scipy_dijkstra(graph, indices=target_node, directed=False)
+        dist = dist_flat.reshape(grid_h, grid_w).astype(np.float32)
 
         finite = np.isfinite(dist)
         if not finite.all():
             max_finite = float(dist[finite].max()) if finite.any() else 0.0
-            xs = (np.arange(grid_h, dtype=np.float32) + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent
-            ys = (np.arange(grid_w, dtype=np.float32) + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent
-            xx, yy = np.meshgrid(xs, ys, indexing="ij")
+            xs_ = (np.arange(grid_h, dtype=np.float32) + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent
+            ys_ = (np.arange(grid_w, dtype=np.float32) + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent
+            xx, yy = np.meshgrid(xs_, ys_, indexing="ij")
             fallback = np.sqrt((xx - target_xy[0]) ** 2 + (yy - target_xy[1]) ** 2)
             dist[~finite] = max_finite + fallback[~finite]
         return dist
@@ -608,6 +624,7 @@ class NavigationEnv(IsaacEnv):
                     img_spec_key: img_spec_val,
                     "direction": UnboundedContinuousTensorSpec((1, 3), device=self.device),
                     "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.device),
+                    "lidar_fov": UnboundedContinuousTensorSpec((1, self._lidar_fov_num_rays), device=self.device),
                 }),
             }).expand(self.num_envs)
         }, shape=[self.num_envs], device=self.device)
@@ -803,6 +820,7 @@ class NavigationEnv(IsaacEnv):
         self.lidar_scan = self.lidar_range - (
             (self.lidar.data.ray_hits_w - self.lidar.data.pos_w.unsqueeze(1))
             .norm(dim=-1)
+            .nan_to_num(nan=self.lidar_range, posinf=self.lidar_range)  # missed rays → max range
             .clamp_max(self.lidar_range)
             .reshape(self.num_envs, 1, *self.lidar_resolution)
         )
@@ -954,11 +972,20 @@ class NavigationEnv(IsaacEnv):
             
         # -----------------Network Input Final--------------
         img_key = "bev" if self.use_bev else "depth"
+
+        # FOV-masked LiDAR: normalized distances [0,1] for beams within camera HFOV.
+        # lidar_scan = lidar_range - distance, so scan/lidar_range gives obstacle proximity
+        # (0 = nothing in range, 1 = obstacle touching sensor).
+        fov_mask = self._lidar_fov_mask_h.to(self.device)
+        lidar_fov = (self.lidar_scan[:, 0, fov_mask, :] / self.lidar_range
+                     ).reshape(self.num_envs, 1, -1)  # (N, 1, num_fov_rays)
+
         obs = {
             "state": drone_state,
             img_key: img_obs,
             "direction": target_dir_2d,
-            "dynamic_obstacle": dyn_obs_states
+            "dynamic_obstacle": dyn_obs_states,
+            "lidar_fov": lidar_fov,
         }
 
 
@@ -1026,6 +1053,7 @@ class NavigationEnv(IsaacEnv):
             self.reward = reward_vel + reward_goal + 1. + reward_safety_static * 1.0 + reward_safety_dynamic * 1.0 - penalty_smooth * 0.1 - penalty_height * 8.0
         else:
             self.reward = reward_vel + reward_goal + 1. + reward_safety_static * 1.0 - penalty_smooth * 0.1 - penalty_height * 8.0
+
 
         # Terminal reward
         # self.reward[collision] -= 50. # collision

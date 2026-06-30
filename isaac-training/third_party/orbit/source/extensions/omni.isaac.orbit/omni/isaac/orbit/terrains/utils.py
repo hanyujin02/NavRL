@@ -49,6 +49,9 @@ def color_meshes_by_height(meshes: list[trimesh.Trimesh], **kwargs) -> trimesh.T
         heights_normalized = np.clip(heights_normalized, 0.1, 0.9)
         # Get the color for each vertex based on the height
         color_map = kwargs.pop("color_map", "turbo")
+        if isinstance(color_map, str) and color_map not in ("magma", "inferno", "plasma", "viridis"):
+            import matplotlib.pyplot as plt
+            color_map = plt.get_cmap(color_map)
         colors = trimesh.visual.color.interpolate(heights_normalized, color_map=color_map)
         # Set the vertex colors
         mesh.visual.vertex_colors = colors

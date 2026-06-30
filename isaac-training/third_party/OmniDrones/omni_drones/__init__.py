@@ -24,6 +24,7 @@
 import os
 
 import torch
+import isaacsim  # must come before omni.isaac.kit on Isaac Sim 4.x
 from omni.isaac.kit import SimulationApp
 from tensordict import TensorDict
 

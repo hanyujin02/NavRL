@@ -74,7 +74,6 @@ class ArticulationView(_ArticulationView):
             scales,
             visibilities,
             reset_xform_properties,
-            enable_dof_force_sensors,
         )
     
     @require_sim_initialized
@@ -90,7 +89,7 @@ class ArticulationView(_ArticulationView):
         carb.log_info("initializing view for {}".format(self._name))
         # TODO: add a callback to set physics view to None once stop is called
         self._physics_view = physics_sim_view.create_articulation_view(
-            self._regex_prim_paths.replace(".*", "*"), self._enable_dof_force_sensors
+            self._regex_prim_paths.replace(".*", "*")
         )
         assert self._physics_view.is_homogeneous
         self._physics_sim_view = physics_sim_view
@@ -246,7 +245,7 @@ class ArticulationView(_ArticulationView):
             return None
 
     def get_world_poses(
-        self, env_indices: Optional[torch.Tensor] = None, clone: bool = True
+        self, env_indices: Optional[torch.Tensor] = None, clone: bool = True, **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         indices = self._resolve_env_indices(env_indices)
         if self._physics_view is not None:
@@ -461,7 +460,7 @@ class RigidPrimView(_RigidPrimView):
         return self
 
     def get_world_poses(
-        self, env_indices: Optional[torch.Tensor] = None, clone: bool = True
+        self, env_indices: Optional[torch.Tensor] = None, clone: bool = True, **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         indices = self._resolve_env_indices(env_indices)
         pos, rot = super().get_world_poses(indices, clone)
