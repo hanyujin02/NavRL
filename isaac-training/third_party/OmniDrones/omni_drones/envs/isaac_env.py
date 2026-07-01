@@ -370,9 +370,21 @@ class IsaacEnv(EnvBase):
                 )
             # obtain the rgb data
             rgb_data = self._rgb_annotator.get_data()
-            # convert to numpy array
-            rgb_data = np.frombuffer(rgb_data, dtype=np.uint8).reshape(*rgb_data.shape)
-            # return the rgb data
+            h, w = self.cfg.viewer.resolution[1], self.cfg.viewer.resolution[0]
+            # Isaac Sim 4.x returns a numpy array directly; older versions return a buffer.
+            if isinstance(rgb_data, np.ndarray):
+                if rgb_data.ndim == 3 and rgb_data.shape[0] == h and rgb_data.shape[1] == w:
+                    return rgb_data[:, :, :3]
+                # Flat or wrong-shape array — reshape using viewport resolution.
+                try:
+                    rgb_data = rgb_data.reshape(h, w, -1)
+                except Exception:
+                    return np.zeros((h, w, 3), dtype=np.uint8)
+            else:
+                try:
+                    rgb_data = np.frombuffer(rgb_data, dtype=np.uint8).reshape(h, w, -1)
+                except Exception:
+                    return np.zeros((h, w, 3), dtype=np.uint8)
             return rgb_data[:, :, :3]
         else:
             raise NotImplementedError(
