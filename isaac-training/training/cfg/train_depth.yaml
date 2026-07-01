@@ -5,6 +5,8 @@ defaults:
   - _self_      # train_depth.yaml overrides take highest priority
 
 env_script: env_depth   # selects training/scripts/env_depth.py
+# checkpoint: /home/hanyujin/NavRL/isaac-training/wandb/run-20260625_132712-ofte5ogv/files/checkpoint_10000.pt        # path to .pt file to resume from; null = train from scratch
+checkpoint: null
 
 headless: True
 device: "cuda:0"
@@ -17,20 +19,20 @@ save_interval: 1000
 
 # Training Environment
 env:
-  num_envs: 16           # increase to 1024 for full training (RTX 4090 recommended)
+  num_envs: 350          # increase to 1024 for full training (RTX 4090 recommended)
   max_episode_length: 2200
   env_spacing: 8.0
-  num_obstacles: 350
-  use_dijkstra_reward: true
+  num_obstacles: 300
+  use_dijkstra_reward: false
   dijkstra_map_extent: 24.0       # covers randomized start/goal sides; terrain obstacles remain within map_range
   dijkstra_grid_resolution: 0.4   # metres/cell for the training-time potential map
   dijkstra_obstacle_height: 0.2   # cells above this terrain height are treated as blocked
   dijkstra_inflate_radius: 0.3    # metres of obstacle inflation for the potential map
   dijkstra_reward_scale: 1.0
   dijkstra_reward_clip: 2.0
-  use_cbf_safety_reward: true
+  use_cbf_safety_reward: false
   cbf_obstacle_inflate_radius: 0.0 # keep raw obstacle geometry; cbf_safe_margin defines safety buffer
-  cbf_safe_margin: 0.6            # h = distance_to_obstacle - margin
+  cbf_safe_margin: 0.3            # h = distance_to_obstacle - margin
   cbf_gamma: 2.0                  # forward-invariance condition: h_dot + gamma * h >= 0
   cbf_reward_scale: 1.0
   cbf_reward_clip: 5.0
@@ -98,8 +100,9 @@ algo:
   feature_extractor:
     use_dyn_obs_net: false
     obs_image_key: depth
-    encoder_type: scratch
+    encoder_type: vit
     encoder_ckpt: null
+    # encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-cnn_20260626_025327/latest.pt
     encoder_ckpt_submodule: ""
     freeze_encoder: false
     embed_dim: 256

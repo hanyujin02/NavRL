@@ -5,6 +5,7 @@ import datetime
 import wandb
 import torch
 from omegaconf import DictConfig, OmegaConf
+import isaacsim  # must come before omni.isaac.kit on Isaac Sim 4.x
 from omni.isaac.kit import SimulationApp
 from ppo import PPO
 from omni_drones.controllers import LeePositionController

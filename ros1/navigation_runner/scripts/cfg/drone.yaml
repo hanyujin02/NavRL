@@ -1,4 +1,4 @@
-drone:  
+drone:
   model_name: "hummingbird"
 
 sensor:
@@ -6,4 +6,9 @@ sensor:
   lidar_vfov: [-10, 20.] # degree
   lidar_vbeams: 4 # number of vertical beams
   lidar_hres: 10. # degree
+  depth_range: 5.0
+  depth_height: 60
+  depth_width: 80
+  focal_length: 10.0
+  horizontal_aperture: 20.955
   

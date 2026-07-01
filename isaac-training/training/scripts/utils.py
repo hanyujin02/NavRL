@@ -185,7 +185,7 @@ def evaluate(
     env.enable_render(not cfg.headless)
     env.reset()
     
-    done = trajs.get(("next", "done")) 
+    done = trajs.get(("next", "done"))
     first_done = torch.argmax(done.long(), dim=1).cpu() # idx of first done will be return for each trajs
 
     def take_first_episode(tensor: torch.Tensor):
@@ -196,18 +196,23 @@ def evaluate(
         k: take_first_episode(v)
         for k, v in trajs[("next", "stats")].cpu().items()
     }
+    # Free the large rollout buffer (holds all obs/depth for all envs×steps) ASAP
+    del trajs, done, first_done
+    torch.cuda.empty_cache()
 
     info = {
-        "eval/stats." + k: torch.mean(v.float()).item() 
+        "eval/stats." + k: torch.mean(v.float()).item()
         for k, v in traj_stats.items()
     }
 
-    # log video
+    # log video then free frame buffer
     info["recording"] = wandb.Video(
-        render_callback.get_video_array(axes="t c h w"), 
-        fps=0.5 / (cfg.sim.dt * cfg.sim.substeps), 
+        render_callback.get_video_array(axes="t c h w"),
+        fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
         format="mp4"
     )
+    render_callback.frames.clear()
+
     env.train()
     # env.reset()
 

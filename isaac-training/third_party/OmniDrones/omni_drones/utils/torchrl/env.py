@@ -93,13 +93,20 @@ class RenderCallback:
     def __call__(self, env, *args):
         if self.i % self.interval == 0:
             frame = env.render(mode="rgb_array")
-            self.frames.append(frame)
+            if frame is not None and frame.ndim == 3:
+                self.frames.append(frame)
             self.t.update(self.interval)
         self.i += 1
         return self.i
-    
+
     def get_video_array(self, axes: str = "t c h w"):
-        return einops.rearrange(np.stack(self.frames), "t h w c -> " + axes)
+        if not self.frames:
+            return np.zeros((1, 3, 1, 1), dtype=np.uint8)
+        # keep only frames matching the most common shape
+        from collections import Counter
+        target_shape = Counter(f.shape for f in self.frames).most_common(1)[0][0]
+        frames = [f for f in self.frames if f.shape == target_shape]
+        return einops.rearrange(np.stack(frames), "t h w c -> " + axes)
 
 
 class EpisodeStats:

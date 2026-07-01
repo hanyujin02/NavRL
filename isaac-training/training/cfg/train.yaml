@@ -4,6 +4,8 @@ defaults:
   - ppo
   - sim
 
+checkpoint: null        # path to .pt file to resume from; null = train from scratch
+
 headless: True
 device: "cuda:0"
 seed: 0

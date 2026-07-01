@@ -22,7 +22,10 @@ import torch
 
 from tensordict.utils import implement_for
 
-from torch.multiprocessing.reductions import ForkingPickler
+try:
+    from torch.multiprocessing.reductions import ForkingPickler
+except ImportError:
+    from multiprocessing.reduction import ForkingPickler
 
 
 class MemoryMappedTensor(torch.Tensor):

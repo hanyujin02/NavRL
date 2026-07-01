@@ -93,7 +93,13 @@ class ReachMapEncoderWrapper(nn.Module):
         super().__init__()
         self.encoder        = encoder
         self.embed_dim      = embed_dim
-        self.out_norm       = nn.LayerNorm(embed_dim)
+        self.projection     = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.ReLU(),
+        )
         self.is_bev         = is_bev
         self._freeze_encoder = freeze_encoder
 
@@ -110,8 +116,23 @@ class ReachMapEncoderWrapper(nn.Module):
         else:
             # x: (N, 1, H, W) depth — treated as (B=N, T=1, H, W)
             pass
-        context, _ = self.encoder(x)
-        return self.out_norm(context)        # (N, embed_dim)
+
+        # For ViT encoders, mean-pool patch tokens instead of the CLS token.
+        # Patch tokens retain local spatial structure even in a frozen encoder,
+        # giving the projection layer meaningful obstacle-proximity features.
+        spatial = getattr(self.encoder, "spatial", None)
+        if spatial is not None and hasattr(spatial, "cls_token"):
+            B, T, H, W = x.shape
+            patches = spatial.patch_embed(x.view(B * T, 1, H, W))       # (B*T, n_patches, D)
+            cls     = spatial.cls_token.expand(B * T, -1, -1)
+            tokens  = spatial.norm(spatial.transformer(
+                torch.cat([cls, patches], dim=1) + spatial.pos_embed
+            ))                                                            # (B*T, 1+n_patches, D)
+            context = tokens[:, 1:].mean(dim=1).view(B, T, self.embed_dim)[:, -1]  # (B, D)
+        else:
+            context, _ = self.encoder(x)
+
+        return self.projection(context)      # (N, embed_dim // 2)
 
 
 def _load_encoder_ckpt(encoder: nn.Module, ckpt_path: str, submodule: str = "") -> None:
@@ -177,7 +198,12 @@ def build_depth_encoder(cfg) -> nn.Module:
             nn.LazyConv2d(out_channels=32, kernel_size=3, stride=2, padding=1), nn.ELU(),
             nn.LazyConv2d(out_channels=64, kernel_size=3, stride=2, padding=1), nn.ELU(),
             Rearrange("n c h w -> n (c h w)"),
-            nn.LazyLinear(embed_dim), nn.LayerNorm(embed_dim),
+            nn.LazyLinear(embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.ReLU(),
         )
 
     # ── ReachMap encoder ─────────────────────────────────────────────────────
@@ -314,10 +340,26 @@ class PPO(TensorDictModuleBase):
         self.gae = GAE(0.99, 0.95) # generalized adavantage esitmation
         self.critic_loss_fn = nn.HuberLoss(delta=10) # huberloss (L1+L2): https://pytorch.org/docs/stable/generated/torch.nn.HuberLoss.html
 
+        # Aux head: predict FOV-masked LiDAR distances from encoder features.
+        # Supervises the encoder (or projection when frozen) to retain obstacle info.
+        fov_key = ("agents", "observation", "lidar_fov")
+        if fov_key in list(observation_spec.keys(True, True)):
+            num_fov_rays = observation_spec[fov_key].shape[-1]
+            embed_out = getattr(cfg.feature_extractor, "embed_dim", 256) // 2
+            self.aux_head = nn.Linear(embed_out, num_fov_rays).to(self.device)
+            self.aux_loss_coeff = getattr(cfg.feature_extractor, "aux_loss_coeff", 0.1)
+            self.aux_optim = torch.optim.Adam(
+                self.aux_head.parameters(), lr=cfg.feature_extractor.learning_rate
+            )
+            self.has_aux_head = True
+            print(f"[NavRL] Aux LiDAR head: {embed_out} → {num_fov_rays} FOV rays (coeff={self.aux_loss_coeff})")
+        else:
+            self.has_aux_head = False
+
         # Optimizer
         self.feature_extractor_optim = torch.optim.Adam(self.feature_extractor.parameters(), lr=cfg.feature_extractor.learning_rate)
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor.learning_rate)
-        self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=cfg.actor.learning_rate)
+        self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic.learning_rate)
 
         # Dummy Input for nn lazymodule
         dummy_input = observation_spec.zero()
@@ -437,13 +479,24 @@ class PPO(TensorDictModuleBase):
         critic_loss_original = self.critic_loss_fn(ret, value)
         critic_loss = torch.max(critic_loss_clipped, critic_loss_original)
 
+        # Aux loss: predict FOV LiDAR distances from _cnn_feature (128-d encoder output).
+        # Gradient flows through the projection (always) and encoder backbone (if not frozen).
+        if self.has_aux_head:
+            cnn_feat = tensordict["_cnn_feature"]          # (batch, 1, embed_dim//2)
+            lidar_target = tensordict["agents", "observation", "lidar_fov"]  # (batch, 1, num_fov_rays)
+            aux_loss = self.aux_loss_coeff * F.mse_loss(self.aux_head(cnn_feat), lidar_target)
+        else:
+            aux_loss = 0.0
+
         # Total Loss
-        loss = entropy_loss + actor_loss + critic_loss
+        loss = entropy_loss + actor_loss + critic_loss + aux_loss
 
         # Optimize
         self.feature_extractor_optim.zero_grad()
         self.actor_optim.zero_grad()
         self.critic_optim.zero_grad()
+        if self.has_aux_head:
+            self.aux_optim.zero_grad()
         loss.backward()
 
         # Skip update if loss is NaN/Inf (e.g., caused by a bad batch)
@@ -459,18 +512,23 @@ class PPO(TensorDictModuleBase):
                 "explained_var": torch.tensor(float("nan"), device=_dev),
             }, [])
 
-        actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.) # to prevent gradient growing too large
+        actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.)
         critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.critic.parameters(), max_norm=5.)
         nn.utils.clip_grad.clip_grad_norm_(self.feature_extractor.parameters(), max_norm=5.)
         self.feature_extractor_optim.step()
         self.actor_optim.step()
         self.critic_optim.step()
+        if self.has_aux_head:
+            self.aux_optim.step()
         explained_var = 1 - F.mse_loss(value, ret) / ret.var().clamp(min=1e-8)
-        return TensorDict({
+        out = TensorDict({
             "actor_loss": actor_loss,
             "critic_loss": critic_loss,
             "entropy": entropy_loss,
             "actor_grad_norm": actor_grad_norm,
             "critic_grad_norm": critic_grad_norm,
-            "explained_var": explained_var
+            "explained_var": explained_var,
         }, [])
+        if self.has_aux_head:
+            out["aux_loss"] = aux_loss.detach() if isinstance(aux_loss, torch.Tensor) else torch.tensor(0.)
+        return out
