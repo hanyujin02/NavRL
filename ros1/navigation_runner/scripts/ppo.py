@@ -14,8 +14,8 @@ from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch
 # ReachMap encoder integration
 # ---------------------------------------------------------------------------
 
-# Path to ReachMap root: scripts/ → training/ → isaac-training/ → NavRL/ → ReachMap/
-_REACHMAP_ROOT = Path(__file__).resolve().parents[4]
+# model/ is bundled alongside this script
+_REACHMAP_ROOT = Path(__file__).resolve().parent
 
 # Encoder types available from ReachMap (depth-input and BEV variants)
 _REACHMAP_DEPTH_ENCODERS = [
@@ -376,7 +376,7 @@ class PPO(TensorDictModuleBase):
         self.actor.apply(init_)
         self.critic.apply(init_)
 
-    def __call__(self, tensordict):
+    def forward(self, tensordict):
         self.feature_extractor(tensordict)
         self.actor(tensordict)
         self.critic(tensordict)
@@ -387,7 +387,7 @@ class PPO(TensorDictModuleBase):
         tensordict["agents", "action"] = actions_world
         return tensordict
 
-    def train(self, tensordict):
+    def update(self, tensordict):
         # tensordict: (num_env, num_frames, dim), batchsize = num_env * num_frames
         next_tensordict = tensordict["next"]
         with torch.no_grad():

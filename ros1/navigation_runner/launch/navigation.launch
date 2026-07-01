@@ -1,0 +1,32 @@
+<launch>
+    <!-- Control mode: set use_px4=true for real PX4 hardware, false for CERLAB sim -->
+    <arg name="use_px4"        default="false" />
+    <arg name="height_control" default="false" />
+    <arg name="takeoff_height" default="1.0" />
+
+    <!-- Topics -->
+    <arg name="depth_topic"   default="/camera/depth/image_raw" />
+    <arg name="odom_topic"    default="/CERLAB/quadcopter/odom" />  <!-- /mavros/local_position/odom for PX4 -->
+    <arg name="goal_topic"    default="/move_base_simple/goal" />
+
+    <!-- Checkpoint filename (inside scripts/ckpts/) -->
+    <arg name="checkpoint"    default="checkpoint_34000(best).pt" />
+
+    <!-- Visualization -->
+    <arg name="rviz"          default="false" />
+
+    <param name="rl/use_px4"  value="$(arg use_px4)" />
+
+    <node pkg="navigation_runner" type="navigation_node.py" name="navigation_node" output="screen">
+        <param name="depth_topic"    value="$(arg depth_topic)" />
+        <param name="odom_topic"     value="$(arg odom_topic)" />
+        <param name="goal_topic"     value="$(arg goal_topic)" />
+        <param name="height_control" value="$(arg height_control)" />
+        <param name="takeoff_height" value="$(arg takeoff_height)" />
+        <param name="checkpoint"     value="$(arg checkpoint)" />
+    </node>
+
+    <group if="$(arg rviz)">
+        <include file="$(find navigation_runner)/launch/rviz.launch" />
+    </group>
+</launch>

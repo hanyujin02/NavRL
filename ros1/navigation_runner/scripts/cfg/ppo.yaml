@@ -34,7 +34,7 @@ algo:
     #   'bev_vit_gru'       TemporalBEVViTEncoder
     #   'bev_cnn_transformer' TemporalTransformerBEVCNNEncoder
     #   'bev_vit_transformer' TemporalTransformerBEVViTEncoder
-    encoder_type: scratch
+    encoder_type: cnn
 
     # Path to a ReachMap checkpoint (best.pt / latest.pt) to initialise the
     # encoder weights.  Only used when encoder_type != 'scratch'.
@@ -54,11 +54,11 @@ algo:
     embed_dim: 256
 
     # Depth image dimensions fed to the encoder (should match sensor config)
-    img_h: 64
-    img_w: 64
+    img_h: 60
+    img_w: 80
 
     # ViT spatial encoder settings (used for 'vit*' and 'rep_vit*' types)
-    patch_size: 8      # 64/8 = 8 patches per side for 64x64 input
+    patch_size: 8      # unused for cnn encoder type
     vit_depth: 4
     num_heads: 8
 

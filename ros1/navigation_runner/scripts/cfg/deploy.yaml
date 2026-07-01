@@ -1,0 +1,27 @@
+defaults:
+  - drone
+  - ppo
+  - _self_
+
+# Compute device
+device: "cuda:0"
+
+# Depth camera (must match your sensor and the trained checkpoint)
+sensor:
+  depth_range: 5.0     # max sensing range in metres
+  depth_height: 60     # image height in pixels
+  depth_width: 80      # image width in pixels
+
+# Policy encoder — must match the architecture the checkpoint was trained with
+algo:
+  feature_extractor:
+    encoder_type: cnn  # scratch | cnn | vit | cnn_gru | vit_gru | ...
+    embed_dim: 256
+    img_h: 60
+    img_w: 80
+    dyn_obs_num: 0
+    use_dyn_obs_net: false
+    obs_image_key: depth
+
+  actor:
+    action_limit: 2.0  # max velocity command (m/s per axis)

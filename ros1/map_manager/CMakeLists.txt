@@ -128,7 +128,7 @@ catkin_package(
 include_directories(
   include
   ${catkin_INCLUDE_DIRS}
-  ${Eigen3_INCLUDE_DIRS}
+  ${EIGEN3_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
 )
 
@@ -173,10 +173,10 @@ add_executable(save_map_node src/save_map_node.cpp)
 #   ${catkin_LIBRARIES}
 # )
 target_link_libraries(${PROJECT_NAME} ${catkin_LIBRARIES} ${PCL_LIBRARIES})
-target_link_libraries(occupancy_map_node ${catkin_LIBRARIES} ${PROJECT_NAME})
-target_link_libraries(esdf_map_node ${catkin_LIBRARIES} ${PROJECT_NAME})
-target_link_libraries(dynamic_map_node ${catkin_LIBRARIES} ${PROJECT_NAME})
-target_link_libraries(save_map_node ${catkin_LIBRARIES} ${PROJECT_NAME})
+target_link_libraries(occupancy_map_node ${catkin_LIBRARIES} ${PROJECT_NAME} ${PCL_LIBRARIES})
+target_link_libraries(esdf_map_node ${catkin_LIBRARIES} ${PROJECT_NAME} ${PCL_LIBRARIES})
+target_link_libraries(dynamic_map_node ${catkin_LIBRARIES} ${PROJECT_NAME} ${PCL_LIBRARIES})
+target_link_libraries(save_map_node ${catkin_LIBRARIES} ${PROJECT_NAME} ${PCL_LIBRARIES})
 
 
 #############
