@@ -18,7 +18,9 @@ save_interval: 1000
 env:
   num_envs: 10 # Number of drones for training
   max_episode_length: 2200
-  env_spacing: 8.0 
+  env_spacing: 8.0
+  attitude_obs: false # must match the training config of the loaded checkpoint:
+                      # true = state input has body roll/pitch appended (10 dims), false = 8 dims
 
 env_dyn:
   num_obstacles: 200 # set to zero if static env is needed

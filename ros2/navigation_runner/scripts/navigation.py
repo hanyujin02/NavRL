@@ -110,7 +110,10 @@ class Navigation(Node):
 
 
     def init_model(self, ckpt_file):
-        observation_dim = 8
+        # must match training env.attitude_obs: appends body roll/pitch to the
+        # state input (8 -> 10 dims). Checkpoints are dim-specific.
+        self.attitude_obs = bool(getattr(self.cfg.env, "attitude_obs", False))
+        observation_dim = 10 if self.attitude_obs else 8
         num_dim_each_dyn_obs_state = 10
         observation_spec = CompositeSpec({
             "agents": CompositeSpec({
@@ -338,7 +341,14 @@ class Navigation(Node):
         vel_g = vec_to_new_frame(vel, target_dir_2d).squeeze(0).squeeze(0) # goal velocity
 
         # drone_state = torch.cat([rpos_clipped, orientation, vel_g], dim=-1).squeeze(1)
-        drone_state = torch.cat([rpos_clipped_g, distance_2d, distance_z, vel_g], dim=-1).unsqueeze(0)
+        state_parts = [rpos_clipped_g, distance_2d, distance_z, vel_g]
+        if self.attitude_obs:
+            # body roll/pitch (rad) from odometry, matching training env.attitude_obs=true
+            q = self.odom.pose.pose.orientation
+            roll = float(np.arctan2(2.0 * (q.w * q.x + q.y * q.z), 1.0 - 2.0 * (q.x * q.x + q.y * q.y)))
+            pitch = float(np.arcsin(np.clip(2.0 * (q.w * q.y - q.z * q.x), -1.0, 1.0)))
+            state_parts.append(torch.tensor([roll, pitch], dtype=rpos_clipped_g.dtype, device=self.cfg.device))
+        drone_state = torch.cat(state_parts, dim=-1).unsqueeze(0)
 
         # Lidar States
         # LiDAR scan (kept for safety gate and safe_action service; not fed to policy)

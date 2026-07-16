@@ -11,7 +11,7 @@ device: "cuda:0"
 seed: 0
 
 # Total Training Length
-max_frame_num: 12e8 # max frame 
+max_frame_num: 6e8 # max frame 
 eval_interval: 1000 # evaluate the policy for every N training steps
 save_interval: 1000
 

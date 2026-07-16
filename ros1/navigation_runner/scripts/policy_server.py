@@ -20,7 +20,9 @@ class policy_server:
         self.policy.eval()
 
     def init_model(self):
-        observation_dim = 8
+        # must match training env.attitude_obs (state 8 -> 10 dims with body roll/pitch)
+        self.attitude_obs = bool(getattr(self.cfg.env, "attitude_obs", False))
+        observation_dim = 10 if self.attitude_obs else 8
         num_dim_each_dyn_obs_state = 10
         observation_spec = CompositeSpec({
             "agents": CompositeSpec({

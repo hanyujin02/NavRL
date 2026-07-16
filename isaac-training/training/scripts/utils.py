@@ -7,6 +7,59 @@ from tensordict.tensordict import TensorDict
 from omni_drones.utils.torchrl import RenderCallback
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
+
+# ── Depth image noise for closed-loop noisy rollout ──────────────────────────
+
+def apply_depth_noise(depth: torch.Tensor, noise_type: str, **kwargs) -> torch.Tensor:
+    """Apply image-level noise to a depth tensor in [0, 1].
+    depth: (..., H, W) — supports any leading batch/channel dims.
+    """
+    if noise_type == "gaussian":
+        return (depth + torch.randn_like(depth) * kwargs.get("sigma", 0.05)).clamp(0.0, 1.0)
+    if noise_type == "dropout":
+        mask = (torch.rand_like(depth) > kwargs.get("rate", 0.15)).float()
+        return depth * mask
+    if noise_type == "cutout":
+        out = depth.clone()
+        H, W = depth.shape[-2], depth.shape[-1]
+        ph = kwargs.get("patch_h", 20)
+        pw = kwargs.get("patch_w", 20)
+        for _ in range(kwargs.get("n_holes", 1)):
+            y0 = int(torch.randint(0, max(1, H - ph + 1), (1,)))
+            x0 = int(torch.randint(0, max(1, W - pw + 1), (1,)))
+            out[..., y0:y0 + ph, x0:x0 + pw] = 0.0
+        return out
+    if noise_type == "quantization":
+        lvl = kwargs.get("levels", 16)
+        return (depth * lvl).floor().clamp(0, lvl) / lvl
+    raise ValueError(f"Unknown noise_type '{noise_type}'")
+
+
+class NoisyPolicyWrapper:
+    """Wraps a NavRL PPO policy and injects depth noise at each rollout step.
+
+    Usage:
+        noisy_policy = NoisyPolicyWrapper(policy, noise_type="gaussian", sigma=0.05)
+        trajs = env.rollout(..., policy=noisy_policy, ...)
+    """
+
+    def __init__(self, policy, noise_type: str, img_key: str = "depth", **noise_kwargs):
+        self._policy     = policy
+        self._noise_type = noise_type
+        self._img_key    = img_key
+        self._noise_kw   = noise_kwargs
+
+    def __call__(self, tensordict: TensorDict) -> TensorDict:
+        obs_key = ("agents", "observation", self._img_key)
+        if obs_key in list(tensordict.keys(True, True)):
+            noisy = apply_depth_noise(tensordict[obs_key], self._noise_type, **self._noise_kw)
+            tensordict[obs_key] = noisy
+        return self._policy(tensordict)
+
+    def __getattr__(self, name):
+        # Proxy attribute access to the underlying policy
+        return getattr(self._policy, name)
+
 class ValueNorm(nn.Module):
     def __init__(
         self,
@@ -162,20 +215,34 @@ def evaluate(
     env,
     policy,
     cfg,
-    seed: int=0, 
-    exploration_type: ExplorationType=ExplorationType.MEAN
+    seed: int = 0,
+    exploration_type: ExplorationType = ExplorationType.MEAN,
+    noise_cfg: dict = None,
 ):
 
     env.enable_render(True)
     env.eval()
     env.set_seed(seed)
 
+    # Optionally wrap policy with noise injection
+    if noise_cfg is not None:
+        noise_type = noise_cfg.get("type")
+        if noise_type:
+            img_key = noise_cfg.get("img_key", "depth")
+            noise_kwargs = {k: v for k, v in noise_cfg.items()
+                           if k not in ("type", "img_key")}
+            eval_policy = NoisyPolicyWrapper(policy, noise_type, img_key, **noise_kwargs)
+        else:
+            eval_policy = policy
+    else:
+        eval_policy = policy
+
     render_callback = RenderCallback(interval=2)
-    
+
     with set_exploration_type(exploration_type):
         trajs = env.rollout(
             max_steps=env.max_episode_length,
-            policy=policy,
+            policy=eval_policy,
             callback=render_callback,
             auto_reset=True,
             break_when_any_done=False,

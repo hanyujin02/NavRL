@@ -8,7 +8,9 @@ from omni_drones.envs.isaac_env import IsaacEnv, AgentSpec
 import omni.isaac.orbit.sim as sim_utils
 from omni_drones.robots.drone import MultirotorBase
 from omni.isaac.orbit.assets import AssetBaseCfg
-from omni.isaac.orbit.terrains import TerrainImporterCfg, TerrainImporter, TerrainGeneratorCfg, HfDiscreteObstaclesTerrainCfg
+from omni.isaac.orbit.terrains import TerrainImporterCfg, TerrainImporter, TerrainGeneratorCfg, HfDiscreteObstaclesTerrainCfg, SubTerrainBaseCfg
+from omni.isaac.orbit.utils import configclass
+import oriented_obstacles
 from omni_drones.utils.torch import euler_to_quaternion, quat_axis
 from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, RayCasterCamera, RayCasterCameraCfg, patterns
 from utils import vec_to_new_frame, vec_to_world, construct_input
@@ -21,6 +23,33 @@ import os
 import re
 from pathlib import Path
 from PIL import Image
+
+
+@configclass
+class OrientedObstaclesTerrainCfg(SubTerrainBaseCfg):
+    """Static obstacles as ONE merged mesh of boxes with random yaw + roll/pitch.
+
+    A single mesh is required because the orbit RayCaster (depth camera and
+    lidar) only supports one mesh prim. Box poses/sizes are captured via
+    oriented_obstacles.last_generated_info for the 2D occupancy grid.
+    """
+
+    function = oriented_obstacles.oriented_obstacles_terrain
+
+    obstacle_seed: int = 0
+    num_obstacles: int = 300
+    obstacle_width_range: tuple = (0.4, 1.1)
+    obstacle_length_range: tuple = (0.4, 1.1)
+    obstacle_height_range: list = [1.0, 1.5, 2.0, 4.0, 6.0]
+    obstacle_height_probability: list = [0.1, 0.15, 0.20, 0.55]
+    yaw_range: tuple = (0.0, 360.0)
+    roll_range: tuple = (-25.0, 25.0)
+    pitch_range: tuple = (-25.0, 25.0)
+    tilt_distribution: str = "uniform"  # "uniform" | "normal" (truncated, std=tilt_std)
+    tilt_std: float = 10.0
+    min_center_distance: float = 1.5
+    border_margin: float = 1.0
+
 
 class NavigationEnv(IsaacEnv):
 
@@ -70,6 +99,11 @@ class NavigationEnv(IsaacEnv):
             # x_dir: lateral (right) displacement per unit depth; y_dir: downward per unit depth
             self.bev_x_dir = ((uu - cx) / fx).reshape(-1).to(cfg.device)  # (H*W,)
             self.bev_y_dir = ((vv - cy) / fy).reshape(-1).to(cfg.device)  # (H*W,)
+
+        # Attitude observation: append body roll/pitch (rad) to the state vector
+        # so the policy can disambiguate body-fixed camera tilt from tilted
+        # obstacles. Must be set before super().__init__() — _set_specs() uses it.
+        self.attitude_obs = bool(getattr(cfg.env, "attitude_obs", False))
 
         super().__init__(cfg, cfg.headless)
 
@@ -129,6 +163,13 @@ class NavigationEnv(IsaacEnv):
         self._depth_saved = False
         self._bev_saved = False
 
+        # 3D policy: drop the per-episode height-band penalty and raise the
+        # termination ceiling so the policy can fly over/under obstacles.
+        self.policy_3d = bool(getattr(cfg.env, "policy_3d", False))
+        if self.policy_3d:
+            print("[NavRL] 3D policy enabled: per-episode height band disabled, "
+                  f"flight band [0.2, {self.map_range[2]}] m")
+
         self.use_dijkstra_reward = getattr(cfg.env, "use_dijkstra_reward", False)
         if self.use_dijkstra_reward:
             self._init_dijkstra_reward()
@@ -174,27 +215,56 @@ class NavigationEnv(IsaacEnv):
         cfg_ground = sim_utils.GroundPlaneCfg(color=(0.1, 0.1, 0.1), size=(300., 300.))
         cfg_ground.func("/World/defaultGroundPlane", cfg_ground, translation=(0, 0, 0.01))
 
-        self.map_range = [20.0, 20.0, 4.5]
+        self.map_range = list(getattr(self.cfg.env, "map_range", [20.0, 20.0, 4.5]))
 
-        self.static_obstacle_cfg = HfDiscreteObstaclesTerrainCfg(
-            horizontal_scale=0.1,
-            vertical_scale=0.1,
-            border_width=0.0,
-            num_obstacles=self.cfg.env.num_obstacles,
-            obstacle_height_mode="range",
-            obstacle_width_range=(0.4, 1.1),
-            obstacle_height_range=[1.0, 1.5, 2.0, 4.0, 6.0],
-            obstacle_height_probability=[0.1, 0.15, 0.20, 0.55],
-            platform_width=0.0,
-        )
+        # obstacle_mode: "hf" = original 2.5D heightfield pillars (no orientation),
+        # "oriented" = single merged mesh of boxes with random yaw + roll/pitch.
+        self.obstacle_mode = str(getattr(self.cfg.env, "obstacle_mode", "hf"))
+        self._oriented_obstacle_info = None
 
         # Patch the terrain function BEFORE terrain_cfg is created so the
         # deep-copy inside TerrainImporterCfg/__post_init__ propagates our wrapper.
-        _orig_fn = self.static_obstacle_cfg.function
+        if self.obstacle_mode == "oriented":
+            obs_cfg = self.cfg.env.obstacle
+            self.static_obstacle_cfg = OrientedObstaclesTerrainCfg(
+                obstacle_seed=int(getattr(obs_cfg, "seed", self.cfg.seed)),
+                num_obstacles=self.cfg.env.num_obstacles,
+                obstacle_width_range=tuple(obs_cfg.width_range),
+                obstacle_length_range=tuple(obs_cfg.length_range),
+                obstacle_height_range=list(obs_cfg.height_range),
+                obstacle_height_probability=list(obs_cfg.height_probability),
+                yaw_range=tuple(obs_cfg.yaw_range),
+                roll_range=tuple(obs_cfg.roll_range),
+                pitch_range=tuple(obs_cfg.pitch_range),
+                tilt_distribution=str(getattr(obs_cfg, "tilt_distribution", "uniform")),
+                tilt_std=float(getattr(obs_cfg, "tilt_std", 10.0)),
+                min_center_distance=float(obs_cfg.min_center_distance),
+                border_margin=float(obs_cfg.border_margin),
+            )
+            _orig_fn = self.static_obstacle_cfg.function
 
-        def _capture_terrain(difficulty, cfg):
-            self._terrain_height_field = _orig_fn.__wrapped__(difficulty, cfg).copy()
-            return _orig_fn(difficulty, cfg)
+            def _capture_terrain(difficulty, cfg):
+                result = _orig_fn(difficulty, cfg)
+                # world-frame box poses/sizes for the 2D occupancy grid
+                self._oriented_obstacle_info = oriented_obstacles.last_generated_info
+                return result
+        else:
+            self.static_obstacle_cfg = HfDiscreteObstaclesTerrainCfg(
+                horizontal_scale=0.1,
+                vertical_scale=0.1,
+                border_width=0.0,
+                num_obstacles=self.cfg.env.num_obstacles,
+                obstacle_height_mode="range",
+                obstacle_width_range=(0.4, 1.1),
+                obstacle_height_range=[1.0, 1.5, 2.0, 4.0, 6.0],
+                obstacle_height_probability=[0.1, 0.15, 0.20, 0.55],
+                platform_width=0.0,
+            )
+            _orig_fn = self.static_obstacle_cfg.function
+
+            def _capture_terrain(difficulty, cfg):
+                self._terrain_height_field = _orig_fn.__wrapped__(difficulty, cfg).copy()
+                return _orig_fn(difficulty, cfg)
 
         self.static_obstacle_cfg.function = _capture_terrain
 
@@ -428,23 +498,37 @@ class NavigationEnv(IsaacEnv):
         )
 
     def _build_dijkstra_occupancy(self, inflate_radius: float):
-        # Use the heightfield captured during _design_scene — guaranteed to match
-        # the simulator's obstacle layout regardless of the TerrainGenerator's
-        # internal random call sequence.
-        height_m = self._terrain_height_field.astype(np.float32) * self.static_obstacle_cfg.vertical_scale
-        blocked_hi = height_m > float(getattr(self.cfg.env, "dijkstra_obstacle_height", 0.2))
-
+        # NOTE: Dijkstra/CBF only support a 2D occupancy grid. In "oriented"
+        # mode the tilted boxes are conservatively projected onto XY over the
+        # flight height band — a tilted beam blocks its whole footprint even
+        # where the drone could pass under/over it.
         grid_h, grid_w = self.dijkstra_shape
-        hi_h, hi_w = blocked_hi.shape
         xs_world = (np.arange(grid_h, dtype=np.float32) + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent
         ys_world = (np.arange(grid_w, dtype=np.float32) + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent
-        x_inside = (xs_world >= -self.map_range[0]) & (xs_world <= self.map_range[0])
-        y_inside = (ys_world >= -self.map_range[1]) & (ys_world <= self.map_range[1])
-        x_idx = np.clip(((xs_world + self.map_range[0]) / (2.0 * self.map_range[0]) * hi_h).astype(np.int64), 0, hi_h - 1)
-        y_idx = np.clip(((ys_world + self.map_range[1]) / (2.0 * self.map_range[1]) * hi_w).astype(np.int64), 0, hi_w - 1)
-        blocked = np.zeros((grid_h, grid_w), dtype=bool)
-        inside = np.outer(x_inside, y_inside)
-        blocked[inside] = blocked_hi[np.ix_(x_idx, y_idx)][inside]
+
+        if self.obstacle_mode == "oriented":
+            z_band = (
+                float(getattr(self.cfg.env, "dijkstra_obstacle_height", 0.2)),
+                float(self.map_range[2]),
+            )
+            blocked = oriented_obstacles.compute_column_occupancy(
+                self._oriented_obstacle_info, xs_world, ys_world, z_band
+            )
+        else:
+            # Use the heightfield captured during _design_scene — guaranteed to match
+            # the simulator's obstacle layout regardless of the TerrainGenerator's
+            # internal random call sequence.
+            height_m = self._terrain_height_field.astype(np.float32) * self.static_obstacle_cfg.vertical_scale
+            blocked_hi = height_m > float(getattr(self.cfg.env, "dijkstra_obstacle_height", 0.2))
+
+            hi_h, hi_w = blocked_hi.shape
+            x_inside = (xs_world >= -self.map_range[0]) & (xs_world <= self.map_range[0])
+            y_inside = (ys_world >= -self.map_range[1]) & (ys_world <= self.map_range[1])
+            x_idx = np.clip(((xs_world + self.map_range[0]) / (2.0 * self.map_range[0]) * hi_h).astype(np.int64), 0, hi_h - 1)
+            y_idx = np.clip(((ys_world + self.map_range[1]) / (2.0 * self.map_range[1]) * hi_w).astype(np.int64), 0, hi_w - 1)
+            blocked = np.zeros((grid_h, grid_w), dtype=bool)
+            inside = np.outer(x_inside, y_inside)
+            blocked[inside] = blocked_hi[np.ix_(x_idx, y_idx)][inside]
 
         inflate_cells = int(np.ceil(inflate_radius / self.dijkstra_grid_resolution))
         if inflate_cells > 0:
@@ -602,7 +686,7 @@ class NavigationEnv(IsaacEnv):
 
 
     def _set_specs(self):
-        observation_dim = 8
+        observation_dim = 10 if self.attitude_obs else 8
         num_dim_each_dyn_obs_state = 10
 
         if self.use_bev:
@@ -909,7 +993,15 @@ class NavigationEnv(IsaacEnv):
         vel_g = vec_to_new_frame(vel_w, target_dir_2d)   # coordinate change for velocity
 
         # final drone's internal states
-        drone_state = torch.cat([rpos_clipped_g, distance_2d, distance_z, vel_g], dim=-1).squeeze(1)
+        state_parts = [rpos_clipped_g, distance_2d, distance_z, vel_g]
+        if self.attitude_obs:
+            # body roll/pitch (rad) from the wxyz quaternion; yaw is excluded
+            # to keep the policy yaw-invariant (goal-frame formulation).
+            qw, qx, qy, qz = self.root_state[..., 3], self.root_state[..., 4], self.root_state[..., 5], self.root_state[..., 6]
+            roll = torch.atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy))
+            pitch = torch.asin((2.0 * (qw * qy - qz * qx)).clamp(-1.0, 1.0))
+            state_parts.append(torch.stack([roll, pitch], dim=-1))
+        drone_state = torch.cat(state_parts, dim=-1).squeeze(1)
 
         if (self.cfg.env_dyn.num_obstacles != 0):
             # ---------Network Input III: Dynamic obstacle states--------
@@ -1040,8 +1132,17 @@ class NavigationEnv(IsaacEnv):
         
         # e. height penalty reward for flying unnessarily high or low
         penalty_height = torch.zeros(self.num_envs, 1, device=self.cfg.device)
-        penalty_height[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)] = ( (self.drone.pos[..., 2] - self.height_range[..., 1] - 0.2)**2 )[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)]
-        penalty_height[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)] = ( (self.height_range[..., 0] - 0.2 - self.drone.pos[..., 2])**2 )[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)]
+        if self.policy_3d:
+            # 3D policy: vertical maneuvering is free; only penalize near the
+            # global floor/ceiling (soft buffer just inside the termination bounds).
+            z_lo, z_hi = 0.4, float(self.map_range[2]) - 0.3
+            above = self.drone.pos[..., 2] > z_hi
+            below = self.drone.pos[..., 2] < z_lo
+            penalty_height[above] = ((self.drone.pos[..., 2] - z_hi) ** 2)[above]
+            penalty_height[below] = ((z_lo - self.drone.pos[..., 2]) ** 2)[below]
+        else:
+            penalty_height[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)] = ( (self.drone.pos[..., 2] - self.height_range[..., 1] - 0.2)**2 )[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)]
+            penalty_height[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)] = ( (self.height_range[..., 0] - 0.2 - self.drone.pos[..., 2])**2 )[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)]
 
 
         # f. Collision condition with its penalty
@@ -1061,7 +1162,7 @@ class NavigationEnv(IsaacEnv):
         # Terminate Conditions
         reach_goal = (distance.squeeze(-1) < 0.5)
         below_bound = self.drone.pos[..., 2] < 0.2
-        above_bound = self.drone.pos[..., 2] > 4.
+        above_bound = self.drone.pos[..., 2] > (float(self.map_range[2]) if self.policy_3d else 4.)
         self.terminated = below_bound | above_bound | collision
         self.truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1) # progress buf is to track the step number
 

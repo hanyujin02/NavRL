@@ -47,6 +47,16 @@ def main(cfg):
             resume="must"
         )
 
+    # Save config files to the wandb run directory for reproducibility
+    import shutil, glob as _glob, yaml as _yaml
+    # 1. Save all raw cfg/*.yaml files
+    for _yf in _glob.glob(os.path.join(FILE_PATH, "*.yaml")):
+        shutil.copy(_yf, run.dir)
+    # 2. Save the fully resolved config (all overrides merged in)
+    with open(os.path.join(run.dir, "config_resolved.yaml"), "w") as _f:
+        _yaml.dump(cfg_dict, _f, default_flow_style=False)
+    wandb.save(os.path.join(run.dir, "*.yaml"), base_path=run.dir, policy="now")
+
     # Navigation Training Environment
     # env_script selects env_lidar (default) or env_depth
     _env_module = __import__(getattr(cfg, "env_script", "env_lidar"))

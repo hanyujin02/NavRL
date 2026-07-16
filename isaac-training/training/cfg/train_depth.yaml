@@ -2,10 +2,12 @@ defaults:
   - drone       # sensor.depth_range/height/width/focal_length/horizontal_aperture
   - ppo         # algo settings + feature_extractor encoder options
   - sim
+  - env         # static environment / obstacle config (map_range, obstacle_mode, num_obstacles, ...)
   - _self_      # train_depth.yaml overrides take highest priority
 
 env_script: env_depth   # selects training/scripts/env_depth.py
 # checkpoint: /home/hanyujin/NavRL/isaac-training/wandb/run-20260625_132712-ofte5ogv/files/checkpoint_10000.pt        # path to .pt file to resume from; null = train from scratch
+# checkpoint: /home/hanyujin/ReachMap/NavRL/isaac-training/wandb/run-20260626_144813-7lu8r8pv/files/checkpoint_34000.pt        # path to .pt file to resume from; null = train from scratch
 checkpoint: null
 
 headless: True
@@ -18,11 +20,11 @@ eval_interval: 1000
 save_interval: 1000
 
 # Training Environment
+# (obstacle layout / map_range / num_obstacles live in cfg/env.yaml)
 env:
   num_envs: 350          # increase to 1024 for full training (RTX 4090 recommended)
   max_episode_length: 2200
   env_spacing: 8.0
-  num_obstacles: 300
   use_dijkstra_reward: false
   dijkstra_map_extent: 24.0       # covers randomized start/goal sides; terrain obstacles remain within map_range
   dijkstra_grid_resolution: 0.4   # metres/cell for the training-time potential map
@@ -49,7 +51,7 @@ viewer:
 
 wandb:
   project: NavRL-depth
-  name: depth_vit_scratch
+  name: depth_cnn_pretrain_attitude
   entity: null            # null = use the logged-in user's default entity
   mode: online            # set to 'offline' to disable cloud sync
   run_id:
@@ -100,11 +102,12 @@ algo:
   feature_extractor:
     use_dyn_obs_net: false
     obs_image_key: depth
-    encoder_type: vit
-    encoder_ckpt: null
-    # encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-cnn_20260626_025327/latest.pt
+    encoder_type: cnn
+    # encoder_ckpt: null
+    encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-cnn_20260626_025327/latest.pt
+    # encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-vit_20260705_022556/latest.pt
     encoder_ckpt_submodule: ""
-    freeze_encoder: false
+    freeze_encoder: true
     embed_dim: 256
     img_h: 60
     img_w: 80
@@ -129,8 +132,11 @@ algo:
 # ── Option F: Pretrained vitfly RepCNN (RepBaseline) ─────────────────────────
 # algo:
 #   feature_extractor:
+#     use_dyn_obs_net: false
+#     obs_image_key: depth
 #     encoder_type: rep_cnn
 #     embed_dim: 256
-#     encoder_ckpt: /path/to/reachmap/checkpoints/<run>/best.pt
-#     freeze_encoder: true
-#     rep_depth_max_m: 4.0  # must match sensor.depth_range
+#     rep_cnn_ckpt: /home/hanyujin/RepBaseline/vitfly/models/ConvNet_model.pth
+#     freeze_encoder: true      # freeze backbone + proj; only PPO heads train
+#     rep_freeze_backbone: true # freeze the RepBaseline conv backbone itself
+#     rep_depth_max_m: 5.0      # must match sensor.depth_range

@@ -109,3 +109,6 @@ isaac-training/training/scripts/outputs/
 isaac-training/third_party/warp/_build/
 
 isaac-training/outputs/
+isaac-training/depth_samples/
+isaac-training/training/scripts/depth_samples/
+isaac-training/training/env_preview/

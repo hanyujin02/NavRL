@@ -1,133 +1,142 @@
 #!/bin/bash
+# Conda environment setup for Isaac Sim 4.x on Blackwell GPUs (RTX 5090/5050/etc.)
+#
+# Usage:
+#   export ISAACSIM_PATH=/path/to/isaac-sim
+#   bash setup_new.sh
 
-# Exit immediately if a command fails
 set -e
 
 ENV_NAME="NavRL"
-# Use NAVRL_DIR instead of SCRIPT_DIR to avoid collision: conda activate sources
-# Isaac Sim's setup_conda_env.sh which overwrites a bare SCRIPT_DIR variable.
-NAVRL_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+ORBIT_PATH="${SCRIPT_DIR}/third_party/orbit"
 
-# ── Prerequisites check ──────────────────────────────────────────────────────
-if [ -z "$ISAACSIM_PATH" ]; then
+# --- Validate ---
+if [ -z "${ISAACSIM_PATH}" ]; then
     echo "[ERROR] ISAACSIM_PATH is not set."
-    echo "        Add the following to ~/.bashrc and then re-run this script:"
-    echo "          export ISAACSIM_PATH=\"/path/to/isaac_sim-2023.1.0-hotfix.1\""
+    echo "  export ISAACSIM_PATH=/path/to/isaac-sim"
     exit 1
 fi
+echo "[INFO] Isaac Sim: ${ISAACSIM_PATH}"
 
-if [ ! -d "$ISAACSIM_PATH" ]; then
-    echo "[ERROR] ISAACSIM_PATH does not exist: $ISAACSIM_PATH"
-    echo "        Make sure Isaac Sim 2023.1.0-hotfix.1 is installed at that path."
-    exit 1
-fi
-if [ ! -f "$ISAACSIM_PATH/setup_conda_env.sh" ]; then
-    echo "[ERROR] $ISAACSIM_PATH does not look like a valid Isaac Sim installation (missing setup_conda_env.sh)."
-    exit 1
-fi
-
-echo "[INFO] Using Isaac Sim at: $ISAACSIM_PATH"
-echo "[INFO] NavRL root: $NAVRL_DIR"
-
-# ── Conda init ───────────────────────────────────────────────────────────────
 eval "$(conda shell.bash hook)"
 
-# ── Step 1: Create conda env ─────────────────────────────────────────────────
-if conda env list | grep -w "^${ENV_NAME}" > /dev/null 2>&1; then
-    echo "[INFO] Conda environment '${ENV_NAME}' already exists — skipping creation."
+# Accept conda TOS (required on fresh installs)
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
+
+# --- Step 1: Create conda env ---
+if conda env list | grep -qw "${ENV_NAME}"; then
+    echo "[INFO] Env '${ENV_NAME}' already exists. Skipping creation."
 else
-    echo "[INFO] Creating conda environment '${ENV_NAME}' (python=3.10)..."
-    conda create -n "$ENV_NAME" python=3.10 -y
+    echo "[INFO] Creating conda env '${ENV_NAME}' with python=3.10..."
+    conda create -n "${ENV_NAME}" python=3.10 -y
 fi
+conda activate "${ENV_NAME}"
 
-# ── Step 2: Orbit symlink + conda activation hooks ───────────────────────────
-echo "[INFO] Setting up Orbit..."
-cd "$NAVRL_DIR/third_party/orbit"
+# --- Step 2: Symlink orbit to Isaac Sim ---
+echo "[INFO] Creating _isaac_sim symlink..."
+cd "${ORBIT_PATH}"
+[ -L "_isaac_sim" ] && rm -f "_isaac_sim"
+ln -s "${ISAACSIM_PATH}" "_isaac_sim"
 
-# Create symlink to Isaac Sim if missing or pointing to wrong target
-if [ -L "_isaac_sim" ]; then
-    if [ "$(readlink _isaac_sim)" != "$ISAACSIM_PATH" ]; then
-        rm -f _isaac_sim
-        ln -s "$ISAACSIM_PATH" _isaac_sim
-        echo "[INFO] Updated symlink: _isaac_sim -> $ISAACSIM_PATH"
-    else
-        echo "[INFO] Symlink _isaac_sim already correct — skipping."
+# --- Step 3: Conda activate/deactivate hooks ---
+echo "[INFO] Setting up conda activation hooks..."
+ACTIVATE_DIR="${CONDA_PREFIX}/etc/conda/activate.d"
+DEACTIVATE_DIR="${CONDA_PREFIX}/etc/conda/deactivate.d"
+mkdir -p "${ACTIVATE_DIR}" "${DEACTIVATE_DIR}"
+
+cat > "${ACTIVATE_DIR}/env_vars.sh" << EOF
+#!/usr/bin/env bash
+echo "Setup Isaac Sim Conda environment."
+export PYTHONPATH_PREV=\$PYTHONPATH
+export LD_LIBRARY_PATH_PREV=\$LD_LIBRARY_PATH
+source "${ISAACSIM_PATH}/setup_conda_env.sh"
+# Prepend conda site-packages so pip-installed torch takes precedence
+# over Isaac Sim's bundled torch (2.2.2+cu118, no sm_120 support)
+export PYTHONPATH="\${CONDA_PREFIX}/lib/python3.10/site-packages:\${PYTHONPATH}"
+export RESOURCE_NAME="IsaacSim"
+EOF
+
+cat > "${DEACTIVATE_DIR}/env_vars.sh" << 'EOF'
+#!/usr/bin/env bash
+unset CARB_APP_PATH EXP_PATH ISAAC_PATH RESOURCE_NAME
+export PYTHONPATH="${PYTHONPATH_PREV}"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH_PREV}"
+EOF
+
+conda install -c conda-forge -y importlib_metadata > /dev/null 2>&1 || true
+conda activate "${ENV_NAME}"
+
+# --- Step 4: Rename Isaac Sim's bundled torch (no sm_120 support) ---
+# Isaac Sim 4.x bundles torch 2.2.2+cu118 which has no Blackwell GPU kernels.
+# Renaming prevents it from shadowing the correct torch we install below.
+ML_PREBUNDLE="${ISAACSIM_PATH}/exts/omni.isaac.ml_archive/pip_prebundle"
+for pkg in torch torchvision torchaudio; do
+    if [ -d "${ML_PREBUNDLE}/${pkg}" ] && [ ! -d "${ML_PREBUNDLE}/${pkg}_bak" ]; then
+        echo "[INFO] Renaming bundled ${pkg} → ${pkg}_bak..."
+        mv "${ML_PREBUNDLE}/${pkg}" "${ML_PREBUNDLE}/${pkg}_bak"
     fi
-elif [ -e "_isaac_sim" ]; then
-    echo "[ERROR] _isaac_sim exists but is not a symlink. Remove it manually."
-    exit 1
-else
-    ln -s "$ISAACSIM_PATH" _isaac_sim
-    echo "[INFO] Created symlink: _isaac_sim -> $ISAACSIM_PATH"
-fi
+done
 
-# orbit.sh --conda writes the Isaac Sim activation hooks into the conda env
-# (it skips env creation when the env already exists)
-./orbit.sh --conda "$ENV_NAME"
+# --- Step 5: Install PyTorch with CUDA 12.8 (sm_120 / Blackwell support) ---
+echo "[INFO] Installing PyTorch 2.x+cu128 (Blackwell compatible)..."
+PYTHONPATH="" "${CONDA_PREFIX}/bin/pip" install \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128
 
-# Activate so subsequent pip/python calls land in the right env
-conda activate "$ENV_NAME"
-
-# ── Step 3: System packages required by Orbit ────────────────────────────────
-# cmake and build-essential are needed to compile Orbit extensions.
-# If you have sudo access, uncomment the line below; otherwise install manually.
-# sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
-echo "[INFO] Assuming cmake and build-essential are already installed."
-echo "       If not, run: sudo apt-get install -y cmake build-essential"
-
-# ── Step 4: Pip packages ─────────────────────────────────────────────────────
-# Use 'python -m pip' to ensure we target the conda env even if 'pip' is not
-# on PATH (the NavRL env ships pip3/pip3.10 but not a bare 'pip' symlink).
+# --- Step 6: Pip packages ---
 echo "[INFO] Installing pip packages..."
-python -m pip install numpy==1.26.4
-python -m pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2
-python -m pip install "pydantic==1.9.2"
-python -m pip install imageio-ffmpeg==0.4.9
-python -m pip install moviepy==1.0.3
-python -m pip install hydra-core==1.3.3
-python -m pip install einops==0.8.2
-python -m pip install pyyaml
-python -m pip install rospkg==1.6.1
-python -m pip install "matplotlib==3.7.1"
-python -m pip install tomli
+PYTHONPATH="" "${CONDA_PREFIX}/bin/pip" install numpy==1.26.4
+PYTHONPATH="" "${CONDA_PREFIX}/bin/pip" install \
+    imageio-ffmpeg==0.4.9 "moviepy==1.0.3" \
+    "hydra-core>=1.3" omegaconf \
+    einops pyyaml rospkg matplotlib tomli wandb \
+    prettytable==3.3.0 hidapi "gymnasium==0.29.0" trimesh "pyglet<2" toml
 
-# ── Step 5: Install Orbit extensions ─────────────────────────────────────────
-echo "[INFO] Installing Orbit extensions..."
-cd "$NAVRL_DIR/third_party/orbit"
-./orbit.sh --install
+# --- Step 7: Orbit extensions ---
+echo "[INFO] Installing orbit extensions..."
+find -L "${ORBIT_PATH}/source/extensions" -mindepth 1 -maxdepth 1 -type d | while read ext; do
+    if [ -f "${ext}/setup.py" ]; then
+        echo "  -> ${ext}"
+        PYTHONPATH="" "${CONDA_PREFIX}/bin/pip" install --no-deps --no-build-isolation -e "${ext}"
+    fi
+done
 
-# ── Step 6: Setup OmniDrones ─────────────────────────────────────────────────
-echo "[INFO] Setting up OmniDrones..."
-cd "$NAVRL_DIR/third_party/OmniDrones"
-# Copy conda activation/deactivation hooks that wire up Isaac Sim env vars
-cp -r conda_setup/etc "$CONDA_PREFIX"
-# Reload env so the new hooks take effect
-conda activate "$ENV_NAME"
-# Install the OmniDrones Python package in editable mode
-python -m pip install -e .
+# --- Step 8: OmniDrones ---
+echo "[INFO] Installing OmniDrones..."
+cp -r "${SCRIPT_DIR}/third_party/OmniDrones/conda_setup/etc" "${CONDA_PREFIX}"
+conda activate "${ENV_NAME}"
+PYTHONPATH="" "${CONDA_PREFIX}/bin/pip" install -e "${SCRIPT_DIR}/third_party/OmniDrones"
 
-# ── Step 7: Verify Isaac Kit import ──────────────────────────────────────────
-echo "[INFO] Verifying omni.isaac.kit..."
-python -c "from omni.isaac.kit import SimulationApp; print('[OK] omni.isaac.kit')"
+# --- Step 9: Rebuild tensordict against new torch ---
+echo "[INFO] Installing tensordict..."
+cd "${SCRIPT_DIR}/third_party/tensordict"
+PYTHONPATH="" "${CONDA_PREFIX}/bin/python" setup.py develop
 
-# ── Step 8: Install TensorDict from source ───────────────────────────────────
-echo "[INFO] Installing TensorDict..."
-python -m pip uninstall -y tensordict 2>/dev/null || true
-cd "$NAVRL_DIR/third_party/tensordict"
-python setup.py develop
-
-# ── Step 9: Install TorchRL from source ──────────────────────────────────────
+# --- Step 10: Rebuild TorchRL against new torch ---
 echo "[INFO] Installing TorchRL..."
-cd "$NAVRL_DIR/third_party/rl"
-python setup.py develop
+cd "${SCRIPT_DIR}/third_party/rl"
+PYTHONPATH="" "${CONDA_PREFIX}/bin/python" setup.py develop
 
-# ── Final verification ────────────────────────────────────────────────────────
-echo "[INFO] Final verification..."
-python -c "import torch; print('[OK] torch', torch.__version__)"
-python -c "import tensordict; print('[OK] tensordict')"
-python -c "import torchrl; print('[OK] torchrl')"
-python -c "import omni_drones; print('[OK] omni_drones')"
+# --- Verify ---
+echo ""
+conda activate "${ENV_NAME}"
+python -c "
+import torch
+print('[INFO] torch:', torch.__version__)
+print('[INFO] CUDA:', torch.version.cuda)
+print('[INFO] GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')
+print('[INFO] sm:', torch.cuda.get_device_capability(0) if torch.cuda.is_available() else 'N/A')
+x = torch.zeros(4, device='cuda')
+print('[INFO] CUDA tensor OK:', x)
+"
 
 echo ""
-echo "Setup completed successfully!"
-echo "To activate the environment: conda activate ${ENV_NAME}"
+echo "=========================================="
+echo " Setup complete!  conda activate ${ENV_NAME}"
+echo "=========================================="
+echo ""
+echo "[NOTE] Isaac Sim 4.x uses 'omni.isaac.lab' (Isaac Lab) instead of"
+echo "       'omni.isaac.orbit'. Training scripts import 'isaacsim' before"
+echo "       'omni.isaac.kit' — this is already handled in the training scripts."

@@ -1,0 +1,78 @@
+defaults:
+  - drone       # sensor params
+  - ppo         # algo / encoder settings
+  - sim
+  - _self_
+
+env_script: env_depth
+checkpoint: null   # required: set on CLI → checkpoint=path/to/checkpoint.pt
+
+headless: True
+device: "cuda:0"
+seed: 0
+
+# Fewer envs for eval — each condition runs a full episode rollout
+env:
+  num_envs: 50
+  max_episode_length: 2200
+  env_spacing: 8.0
+  num_obstacles: 350
+  use_dijkstra_reward: false
+
+env_dyn:
+  num_obstacles: 0
+
+viewer:
+  eye: [0., 40., 40.]
+  lookat: [0., 2.5, 0.]
+  resolution: [960, 720]
+
+wandb:
+  project: NavRL-eval
+  name: eval-noise
+  entity: null
+  mode: online
+  run_id: null
+
+# ── Noise evaluation settings ────────────────────────────────────────────────
+eval:
+  run_noise: true   # set false to only run the clean condition
+
+  # Each entry becomes one closed-loop rollout.
+  # "name"  → wandb log prefix (e.g. "gaussian_high/stats.reach_goal")
+  # "type"  → noise function: gaussian | dropout | cutout | quantization | null
+  # remaining keys → noise kwargs passed directly to apply_depth_noise()
+  noise_conditions:
+    - name: gaussian_low
+      type: gaussian
+      sigma: 0.01
+    - name: gaussian_mid
+      type: gaussian
+      sigma: 0.05
+    - name: gaussian_high
+      type: gaussian
+      sigma: 0.10
+    - name: dropout_low
+      type: dropout
+      rate: 0.05
+    - name: dropout_mid
+      type: dropout
+      rate: 0.15
+    - name: dropout_high
+      type: dropout
+      rate: 0.30
+    - name: cutout_low
+      type: cutout
+      patch_h: 10
+      patch_w: 10
+      n_holes: 1
+    - name: cutout_mid
+      type: cutout
+      patch_h: 20
+      patch_w: 20
+      n_holes: 1
+    - name: cutout_high
+      type: cutout
+      patch_h: 30
+      patch_w: 30
+      n_holes: 1

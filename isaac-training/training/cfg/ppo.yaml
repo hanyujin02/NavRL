@@ -93,12 +93,12 @@ algo:
 
   actor:
     learning_rate: 5e-5
-    clip_ratio: 0.2
+    clip_ratio: 0.2   # matches depth_cnn_pretrain run (7lu8r8pv)
     action_limit: 2.0
 
   critic:
     learning_rate: 3e-4
-    clip_ratio: 0.2
+    clip_ratio: 0.2   # matches depth_cnn_pretrain run (7lu8r8pv)
 
   entropy_loss_coefficient: 1e-2
 
