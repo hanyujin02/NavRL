@@ -64,6 +64,11 @@ class NavigationEnv(IsaacEnv):
         print("[Navigation Environment]: Initializing Env...")
         # Depth camera params
         self.depth_range = cfg.sensor.depth_range
+        # Divisor for the encoder's normalized depth observation. Defaults to
+        # depth_range (obs in [0,1]). Set differently to rescale the input the
+        # frozen pretrained encoder sees, e.g. 10.0 compresses obs to [0,0.5]
+        # to match an encoder pretrained with ReachMap max_depth=10.
+        self.depth_obs_divisor = float(getattr(cfg.sensor, "depth_obs_divisor", None) or self.depth_range)
         self.depth_height = cfg.sensor.depth_height
         self.depth_width = cfg.sensor.depth_width
 
@@ -942,9 +947,10 @@ class NavigationEnv(IsaacEnv):
                 print(f"[NavRL] Saved {n_save} depth+BEV samples to {save_dir.resolve()}")
                 self._bev_saved = True
         else:
-            # All depth encoders (cnn, vit, rep_*) receive depth normalised to [0, 1]
-            # using the sensor maximum range (depth_range = 5.0 m).
-            depth_norm = depth_data / self.depth_range   # (N, 1, H, W) in [0, 1]
+            # All depth encoders (cnn, vit, rep_*) receive depth normalised by
+            # depth_obs_divisor (== depth_range by default → [0, 1]; a larger
+            # divisor rescales the frozen encoder's input, see __init__).
+            depth_norm = depth_data / self.depth_obs_divisor   # (N, 1, H, W)
             img_obs = depth_norm
 
             if not self._depth_saved:

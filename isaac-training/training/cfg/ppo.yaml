@@ -102,6 +102,14 @@ algo:
 
   entropy_loss_coefficient: 1e-2
 
+  # LR decay over training iterations (one iteration = one collector batch =
+  # num_envs * training_frame_num frames). Applied to feature_extractor, actor,
+  # critic (and aux) optimizers. Late-run eval oscillation motivated this
+  # (adjacent-eval SR swings of ±0.2 at 40k+ iters with constant lr).
+  lr_decay: null          # null | linear | cosine
+  lr_decay_iters: 4e4     # iterations to reach the floor; stays at floor after
+  lr_decay_min_factor: 0.1  # floor = base_lr * this factor
+
   training_frame_num: 64
   training_epoch_num: 2
   num_minibatches: 8

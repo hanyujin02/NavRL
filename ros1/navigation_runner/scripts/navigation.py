@@ -27,6 +27,9 @@ class Navigation:
         self.depth_height = cfg.sensor.depth_height
         self.depth_width = cfg.sensor.depth_width
         self.depth_range = cfg.sensor.depth_range
+        # Divisor for the normalized depth obs fed to the encoder — MUST match
+        # sensor.depth_obs_divisor used at training time (null = depth_range).
+        self.depth_obs_divisor = float(getattr(cfg.sensor, "depth_obs_divisor", None) or self.depth_range)
         self.depth_image = None
         self.depth_received = False
         try:
@@ -188,7 +191,7 @@ class Navigation:
         depth_np = np.nan_to_num(depth_np, nan=self.depth_range, posinf=self.depth_range, neginf=0.0)
         depth_np = np.clip(depth_np, 0.0, self.depth_range)
         depth_t = torch.tensor(depth_np, dtype=torch.float32, device=self.cfg.device)
-        self.depth_image = (depth_t / self.depth_range).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        self.depth_image = (depth_t / self.depth_obs_divisor).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
         self.depth_received = True
 
     def odom_callback(self, odom):

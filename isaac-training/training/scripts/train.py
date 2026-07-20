@@ -95,6 +95,14 @@ def main(cfg):
         exploration_type=ExplorationType.RANDOM, # sample from normal distribution
     )
 
+    # Best-checkpoint tracking: single eval points are noisy (adjacent evals can
+    # swing 0.2-0.6 in reach_goal on this fixed hard-eval scenario — see 2026-07
+    # log analysis), so "best" is judged on an EMA of eval reach_goal rather than
+    # the raw single-point score, to avoid crowning a lucky outlier eval.
+    best_eval_sr_ema = None
+    best_eval_sr_raw = float("-inf")
+    eval_sr_ema_alpha = float(getattr(cfg, "best_ckpt_ema_alpha", 0.3))
+
     # Training Loop
     for i, data in enumerate(collector):
         # print("data: ", data)
@@ -119,7 +127,8 @@ def main(cfg):
         if i % cfg.eval_interval == 0:
             print("[NavRL]: start evaluating policy at training step: ", i)
             torch.cuda.empty_cache()
-            env.enable_render(True)
+            if bool(getattr(cfg, "eval_video", True)):
+                env.enable_render(True)
             env.eval()
             eval_info = evaluate(
                 env=transformed_env,
@@ -134,7 +143,20 @@ def main(cfg):
             torch.cuda.empty_cache()
             info.update(eval_info)
             print("\n[NavRL]: evaluation done.")
-        
+
+            # Track best checkpoint by EMA-smoothed eval reach_goal
+            eval_sr = eval_info.get("eval/stats.reach_goal")
+            if eval_sr is not None:
+                best_eval_sr_ema = eval_sr if best_eval_sr_ema is None \
+                    else eval_sr_ema_alpha * eval_sr + (1 - eval_sr_ema_alpha) * best_eval_sr_ema
+                info["eval/stats.reach_goal_ema"] = best_eval_sr_ema
+                if best_eval_sr_ema > best_eval_sr_raw:
+                    best_eval_sr_raw = best_eval_sr_ema
+                    best_ckpt_path = os.path.join(run.dir, "best.pt")
+                    torch.save(policy.state_dict(), best_ckpt_path)
+                    print(f"[NavRL]: new best checkpoint (eval SR ema={best_eval_sr_ema:.3f}) "
+                          f"saved at training step {i}")
+
         # Update wand info
         run.log(info)
 

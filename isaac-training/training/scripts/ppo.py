@@ -361,6 +361,21 @@ class PPO(TensorDictModuleBase):
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor.learning_rate)
         self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic.learning_rate)
 
+        # LR decay: factor schedule over training iterations (one per train() call).
+        # Note: the iteration counter restarts at 0 when resuming from a checkpoint
+        # (only module weights are saved), so a resumed run re-warms from base lr.
+        self.lr_decay            = getattr(cfg, "lr_decay", None)
+        self.lr_decay_iters      = int(float(getattr(cfg, "lr_decay_iters", 40000)))  # float() first: YAML "4e4" parses as str
+        self.lr_decay_min_factor = float(getattr(cfg, "lr_decay_min_factor", 0.1))
+        self._lr_iter = 0
+        self._lr_optims = [self.feature_extractor_optim, self.actor_optim, self.critic_optim]
+        if self.has_aux_head:
+            self._lr_optims.append(self.aux_optim)
+        self._lr_base = [[g["lr"] for g in opt.param_groups] for opt in self._lr_optims]
+        if self.lr_decay:
+            print(f"[NavRL] LR decay: {self.lr_decay} over {self.lr_decay_iters} iters "
+                  f"(floor {self.lr_decay_min_factor}x)")
+
         # Dummy Input for nn lazymodule
         dummy_input = observation_spec.zero()
         # print("dummy_input: ", dummy_input)
@@ -387,8 +402,29 @@ class PPO(TensorDictModuleBase):
         tensordict["agents", "action"] = actions_world
         return tensordict
 
+    def _lr_decay_factor(self) -> float:
+        if not self.lr_decay:
+            return 1.0
+        t = min(self._lr_iter / max(self.lr_decay_iters, 1), 1.0)
+        m = self.lr_decay_min_factor
+        if self.lr_decay == "linear":
+            return 1.0 - (1.0 - m) * t
+        if self.lr_decay == "cosine":
+            import math
+            return m + 0.5 * (1.0 - m) * (1.0 + math.cos(math.pi * t))
+        raise ValueError(f"Unknown lr_decay '{self.lr_decay}' (use null, 'linear' or 'cosine')")
+
     def train(self, tensordict):
         # tensordict: (num_env, num_frames, dim), batchsize = num_env * num_frames
+
+        # Apply LR decay before this iteration's updates
+        lr_factor = self._lr_decay_factor()
+        if self.lr_decay:
+            for opt, base_lrs in zip(self._lr_optims, self._lr_base):
+                for group, base in zip(opt.param_groups, base_lrs):
+                    group["lr"] = base * lr_factor
+        self._lr_iter += 1
+
         next_tensordict = tensordict["next"]
         with torch.no_grad():
             self.feature_extractor.eval()
@@ -445,7 +481,10 @@ class PPO(TensorDictModuleBase):
         infos = torch.stack(infos).to_tensordict()
         
         infos = infos.apply(torch.mean, batch_size=[])
-        return {k: v.item() for k, v in infos.items()}    
+        out = {k: v.item() for k, v in infos.items()}
+        out["lr_factor"] = lr_factor
+        out["actor_lr"] = self.actor_optim.param_groups[0]["lr"]
+        return out    
 
     
     def _update(self, tensordict): # tensordict shape (batch_size, )

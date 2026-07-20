@@ -220,7 +220,13 @@ def evaluate(
     noise_cfg: dict = None,
 ):
 
-    env.enable_render(True)
+    # eval_video=false skips the RTX viewer/recording pipeline entirely —
+    # saves GPU render buffers + a ~2.5 GB CPU frame buffer per eval and
+    # several seconds of encode time. Depth sensors are unaffected (they use
+    # their own render products regardless of enable_render).
+    eval_video = bool(getattr(cfg, "eval_video", True))
+    if eval_video:
+        env.enable_render(True)
     env.eval()
     env.set_seed(seed)
 
@@ -237,7 +243,7 @@ def evaluate(
     else:
         eval_policy = policy
 
-    render_callback = RenderCallback(interval=2)
+    render_callback = RenderCallback(interval=2) if eval_video else None
 
     with set_exploration_type(exploration_type):
         trajs = env.rollout(
@@ -273,12 +279,13 @@ def evaluate(
     }
 
     # log video then free frame buffer
-    info["recording"] = wandb.Video(
-        render_callback.get_video_array(axes="t c h w"),
-        fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
-        format="mp4"
-    )
-    render_callback.frames.clear()
+    if eval_video:
+        info["recording"] = wandb.Video(
+            render_callback.get_video_array(axes="t c h w"),
+            fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
+            format="mp4"
+        )
+        render_callback.frames.clear()
 
     env.train()
     # env.reset()

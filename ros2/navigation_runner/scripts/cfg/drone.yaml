@@ -7,6 +7,9 @@ sensor:
   lidar_vbeams: 4 # number of vertical beams
   lidar_hres: 10. # degree
   depth_range: 5.0
+  # Divisor for the normalized depth obs fed to the encoder. MUST match
+  # sensor.depth_obs_divisor used at training time (null = depth_range → [0,1]).
+  depth_obs_divisor: null
   depth_height: 60
   depth_width: 80
   focal_length: 10.0

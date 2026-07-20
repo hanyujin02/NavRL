@@ -9,6 +9,10 @@ device: "cuda:0"
 # Depth camera (must match your sensor and the trained checkpoint)
 sensor:
   depth_range: 5.0     # max sensing range in metres
+  # Divisor for the normalized depth obs fed to the encoder.
+  # MUST match sensor.depth_obs_divisor used at training time
+  # (null = depth_range → obs in [0,1]; e.g. 2.5 → obs in [0,2]).
+  depth_obs_divisor: null
   depth_height: 60     # image height in pixels
   depth_width: 80      # image width in pixels
 

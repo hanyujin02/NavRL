@@ -19,10 +19,17 @@ max_frame_num: 12e8
 eval_interval: 1000
 save_interval: 1000
 
+# Skip eval video recording (RTX viewer pipeline + ~2.5 GB frame buffer).
+# Depth sensors and all eval metrics are unaffected; only the wandb mp4 is dropped.
+eval_video: false
+
 # Training Environment
 # (obstacle layout / map_range / num_obstacles live in cfg/env.yaml)
 env:
-  num_envs: 350          # increase to 1024 for full training (RTX 4090 recommended)
+  # 224 envs (was 350) to fit a ~16 GB GPU budget — camera/physics memory scales
+  # linearly with num_envs. PPO batch size is preserved exactly via
+  # algo.training_frame_num: 100 below (224 x 100 = 22400 = 350 x 64).
+  num_envs: 350
   max_episode_length: 2200
   env_spacing: 8.0
   use_dijkstra_reward: false
@@ -51,7 +58,7 @@ viewer:
 
 wandb:
   project: NavRL-depth
-  name: depth_cnn_pretrain_attitude
+  name: depth_cnn_pretrain(dino)_attitude_depth
   entity: null            # null = use the logged-in user's default entity
   mode: online            # set to 'offline' to disable cloud sync
   run_id:
@@ -61,6 +68,13 @@ wandb:
 # ---------------------------------------------------------------------------
 sensor:
   depth_range: 5.0        # max sensing range (m); must match algo.feature_extractor.rep_depth_max_m
+  # Divisor for the normalized depth obs fed to the encoder (null = depth_range → [0,1]).
+  # Applies identically to ALL non-BEV encoders (scratch included). A trainable
+  # scratch encoder absorbs this constant in its first conv layer, so it only
+  # materially affects FROZEN pretrained encoders (input contrast gain).
+  # RL results (2026-07): new 5m-norm encoder + 2.5 (2x gain) > + 5 (matched),
+  # ≈ old 10m-norm encoder + 5 — mirrors the historical accidental 2x mismatch.
+  depth_obs_divisor: 5
   depth_height: 60        # image height (pixels)
   depth_width: 80         # image width (pixels)
   focal_length: 10.0      # ~90 deg horizontal FOV: hfov = 2*atan(aperture/(2*focal_length))
@@ -99,12 +113,15 @@ sensor:
 
 # ── Option D: ReachMap depth ViT, no temporal, trained from scratch ──────────
 algo:
+  # 100 frames/iter x 224 envs = 22400 frames per PPO batch — identical to the
+  # previous 350 x 64, so gradient batch statistics are unchanged.
+  # training_frame_num: 100
   feature_extractor:
     use_dyn_obs_net: false
     obs_image_key: depth
     encoder_type: cnn
     # encoder_ckpt: null
-    encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-cnn_20260626_025327/latest.pt
+    encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-cnn-dino/latest.pt
     # encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-vit_20260705_022556/latest.pt
     encoder_ckpt_submodule: ""
     freeze_encoder: true
