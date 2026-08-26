@@ -2,7 +2,6 @@ algo:
   feature_extractor:
     learning_rate: 1e-4
     dyn_obs_num: 0
-    aux_loss_coeff: 0   # weight for FOV LiDAR aux supervision loss (0 = disabled)
 
     # Observation key for the image input: 'lidar' (default), 'depth', or 'bev'
     # 'bev' is set automatically when encoder_type starts with 'bev_'
@@ -49,8 +48,16 @@ algo:
     # Freeze encoder weights after loading checkpoint (fine-tune PPO heads only)
     freeze_encoder: false
 
+    # Only consulted when freeze_encoder=true. true (default) freezes
+    # BatchNorm running_mean/var too (encoder stays in eval() mode always —
+    # see ReachMapEncoderWrapper). false leaves conv/linear weights frozen
+    # (requires_grad=False) but lets BN running stats keep adapting to the
+    # live rollout data distribution during training.
+    freeze_bn: true
+
     # Output feature dimension (must match embed_dim used when training the ckpt)
     embed_dim: 256
+    projection_mlp: true  # add a 2-layer MLP projection head after the encoder output
 
     # Depth image dimensions fed to the encoder (should match sensor config)
     img_h: 64

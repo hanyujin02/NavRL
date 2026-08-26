@@ -11,13 +11,112 @@ headless: True
 device: "cuda:0"
 seed: 0
 
-# Fewer envs for eval — each condition runs a full episode rollout
+# 0=disabled (default, fastest — depth sensor is unaffected either way).
+# 1=TAA, 2=FXAA, 3=DLSS, 4=RTXAA — override for a cleaner one-off
+# eval_video=true recording; RTX's real-time renderer needs temporal
+# accumulation/denoising to look clean, which AA=0 skips.
+anti_aliasing: 0
+
+# num_envs=350 (matching training, see env: block below) with the default
+# eval_video=true holds a full rendered-frame buffer per env for the whole
+# 2200-step episode (utils.py's own comment: "~2.5 GB CPU frame buffer per
+# eval" — that's at smaller env counts) — OOMs a 31GB GPU well before the end
+# of even the first condition's rollout. Depth-camera observations (what the
+# policy/noise actually operate on) are unaffected by this — only the RTX
+# viewer/video-logging pipeline is skipped. Re-enable per-run via
+# eval_video=true on the CLI if you actually want to inspect a video.
+eval_video: false
+
+# ppo.yaml doesn't define use_dyn_obs_net at all, so ppo.py:322's
+# getattr(..., "use_dyn_obs_net", True) silently defaults to True, building a
+# 4-module feature_extractor (encoder, dyn_obs_net, CatTensors, MLP). All
+# target checkpoints were trained with use_dyn_obs_net=false (dyn_obs_num=0,
+# no dynamic obstacles) -> 3-module extractor (encoder, CatTensors, MLP) — the
+# MLP lands at module.2 there vs module.3 here, so the checkpoint's module.2.*
+# keys don't match any parameter in the freshly-built model and get silently
+# dropped as "unexpected", leaving the MLP at its random init.
+algo:
+  feature_extractor:
+    use_dyn_obs_net: false
+
+# Full sensor spec (depth camera + safety lidar), copied from train_depth.yaml.
+# drone.yaml's sensor: block (pulled in via defaults above) only has the bare
+# depth-camera fields at the old 64x64 default — env_depth.py unconditionally
+# also reads cfg.sensor.lidar_* (safety/CBF reward + collision check) and
+# depth_obs_divisor, which drone.yaml doesn't define, and the depth_height/
+# width here must match what the checkpoint's encoder was actually trained on.
+sensor:
+  depth_range: 5.0
+  depth_obs_divisor: 5
+  depth_height: 60
+  depth_width: 80
+  focal_length: 10.0
+  horizontal_aperture: 20.955
+  lidar_range: 4.0
+  lidar_vfov: [-10., 20.]
+  lidar_vbeams: 4
+  lidar_hres: 10.
+
+# env_depth.py's eval-mode reset lays out every env's spawn/goal position as a
+# function of num_envs ((env_ids/num_envs - 0.5) * 32, see
+# _reset_idx/reset_target), so this is a fixed course whose layout itself
+# depends on num_envs — matching training's actual num_envs=350 exactly
+# reproduces the identical course each checkpoint was historically evaluated
+# on. num_obstacles=300 matches training's obstacle count/placement (this
+# file previously had these two values swapped, which put every checkpoint on
+# an unfamiliar course and silently produced reach_goal=0 regardless of
+# checkpoint quality — see git blame / session notes).
+#
+# num_envs is reduced to 200 here instead of the exact 350: at 350, a single
+# 2200-step depth-observation rollout uses ~25.6GB of the ~25.7GB actually
+# available to PyTorch on a 31GB GPU (Isaac Sim's own scene/sensor overhead
+# takes the rest) — zero margin, and noise-condition rollouts OOM. 200 gives
+# real headroom (~15GB estimated) while still being a large enough sample for
+# stable statistics. This means results are NOT numerically comparable to the
+# historical per-checkpoint eval/stats.reach_goal values logged during
+# training (different course), but ARE valid for comparing the 12 checkpoints
+# against each other under this sweep, since they all use the same num_envs.
 env:
-  num_envs: 50
+  num_envs: 200
   max_episode_length: 2200
   env_spacing: 8.0
-  num_obstacles: 350
+  num_obstacles: 300
   use_dijkstra_reward: false
+  # obstacle_mode/policy_3d: not inherited from env.yaml (this config's
+  # defaults list is [drone, ppo, sim, _self_], no `env` group) — declared
+  # here so they're overridable from the CLI without needing `+env.foo=...`.
+  # hf = original flat 2.5D heightfield pillars (matches all 12 target
+  # checkpoints' training distribution); oriented = tilted-box obstacles, an
+  # OOD generalization probe — see run_eval_oriented3d_sweep.sh.
+  obstacle_mode: hf
+  policy_3d: false
+  # Only read when obstacle_mode=oriented (env_depth.py: self.cfg.env.obstacle.*).
+  # Originally copied verbatim from env.yaml's defaults (this config doesn't
+  # inherit that file, so they'd otherwise be missing entirely -
+  # AttributeError); roll_range narrowed 2026-08-13 from env.yaml's [-90,90]
+  # to match pitch_range — the first oriented3d sweep at +-90 let obstacles
+  # tip past horizontal, an extreme none of these hf-trained checkpoints
+  # could plausibly generalize to. env.yaml's own default is untouched.
+  obstacle:
+    seed: 2
+    width_range: [0.4, 1.1]
+    length_range: [0.4, 1.1]
+    height_range: [1.0, 1.5, 2.0, 4.0, 6.0]
+    height_probability: [0.10, 0.15, 0.20, 0.55]
+    yaw_range: [0.0, 360.0]
+    roll_range: [-25.0, 25.0]
+    pitch_range: [-25.0, 25.0]
+    tilt_distribution: normal
+    tilt_std: 10.0
+    min_center_distance: 1.5
+    border_margin: 1.0
+  # env_depth.py: observation_dim = 10 if attitude_obs else 8 (appends body
+  # roll/pitch to state). All target checkpoints were trained with this on —
+  # leaving it at the getattr(...) default of False silently builds an 8-dim
+  # obs spec, so the policy's projection-layer weights fail to load (skipped
+  # as "unexpected" under strict=False) and the eval runs a randomly
+  # initialized policy instead of the trained one.
+  attitude_obs: true
 
 env_dyn:
   num_obstacles: 0
@@ -38,6 +137,32 @@ wandb:
 eval:
   run_noise: true   # set false to only run the clean condition
 
+  # Set false (per-invocation CLI override) to skip the auto-prepended clean
+  # condition — used to run exactly one condition per process/GPU memory
+  # budget. See run_eval_noise_sweep.sh.
+  include_clean: true
+
+  # Set false to skip the "*_maxfill" dropout/cutout variants (fill_value=1.0
+  # = max-range/no-return fill) and only run the zero-fill originals.
+  include_maxfill: true
+
+  # Symmetric to include_maxfill: set false to skip the zero-fill dropout/
+  # cutout originals and only run the "*_maxfill" variants (e.g. for a
+  # maxfill-only validation/sweep that doesn't re-run already-published
+  # zero-fill results).
+  include_zerofill: true
+
+  # Repeat each NOISY condition (clean is unaffected — no randomness to vary)
+  # this many times with independent noise draws, all within one process so
+  # the scenario stays fixed and only the sampled noise differs. Logs mean
+  # under the original key + "_std" alongside when > 1.
+  n_trials: 1
+
+  # Which noise types to run this pass. Entries in noise_conditions whose
+  # "type" is not in this list are skipped (clean condition always runs).
+  # Remove a type here to disable it without touching noise_conditions below.
+  types: [gaussian, dropout, cutout, quantization]
+
   # Each entry becomes one closed-loop rollout.
   # "name"  → wandb log prefix (e.g. "gaussian_high/stats.reach_goal")
   # "type"  → noise function: gaussian | dropout | cutout | quantization | null
@@ -52,27 +177,89 @@ eval:
     - name: gaussian_high
       type: gaussian
       sigma: 0.10
+    # Recalibrated 2026-08-12: the original 0.05/0.15/0.30 rates already
+    # collapsed most checkpoints to reach_goal=0 by "mid" (0.15) — a zeroed
+    # depth pixel reads as "obstacle at zero distance" in this codebase's
+    # depth_m/depth_range normalization, so dropout/cutout are much more
+    # alarming to the policy per-percent-corrupted than gaussian/quantization.
+    # New levels validated on run-20260806_230332 (reach_ae seed0, clean SR
+    # 0.85): dropout 0.85→0.87→0.68→0.36, cutout 0.85→0.92→0.67→0.35 across
+    # clean/low/mid/high — a real monotonic gradient instead of low=clean,
+    # mid=high=0.
     - name: dropout_low
       type: dropout
-      rate: 0.05
+      rate: 0.01
     - name: dropout_mid
       type: dropout
-      rate: 0.15
+      rate: 0.05
     - name: dropout_high
       type: dropout
-      rate: 0.30
+      rate: 0.07
     - name: cutout_low
       type: cutout
-      patch_h: 10
-      patch_w: 10
+      patch_h: 7
+      patch_w: 7
       n_holes: 1
     - name: cutout_mid
       type: cutout
-      patch_h: 20
-      patch_w: 20
+      patch_h: 18
+      patch_w: 18
       n_holes: 1
     - name: cutout_high
       type: cutout
-      patch_h: 30
-      patch_w: 30
+      patch_h: 22
+      patch_w: 22
       n_holes: 1
+    - name: quantization_low
+      type: quantization
+      levels: 32
+    - name: quantization_mid
+      type: quantization
+      levels: 16
+    - name: quantization_high
+      type: quantization
+      levels: 8
+
+    # ── "max-range fill" variants ──────────────────────────────────────────
+    # dropout/cutout above zero-fill corrupted pixels (fill_value=0.0 default,
+    # i.e. depth=0 = "obstacle touching the sensor"). But this env's own
+    # sensor pipeline (env_depth.py: nan_to_num(nan=depth_range), lidar
+    # "missed rays -> max range") treats a lost/no-return ray as MAX range,
+    # not zero — the physically standard convention for occlusion/absorption/
+    # out-of-range failures. These _maxfill conditions test that alternative:
+    # corrupted pixels read as "nothing detected" (fly-through risk) instead
+    # of "phantom near obstacle" (dodge-safe risk). Same rate/patch sizes as
+    # the zero-fill conditions above for direct comparison. These ride on the
+    # same eval.types gate as their zero-fill counterparts (type: dropout /
+    # cutout); set eval.include_maxfill=false to skip just these and keep
+    # only the zero-fill originals.
+    - name: dropout_low_maxfill
+      type: dropout
+      rate: 0.01
+      fill_value: 1.0
+    - name: dropout_mid_maxfill
+      type: dropout
+      rate: 0.05
+      fill_value: 1.0
+    - name: dropout_high_maxfill
+      type: dropout
+      rate: 0.07
+      fill_value: 1.0
+    - name: cutout_low_maxfill
+      type: cutout
+      patch_h: 7
+      patch_w: 7
+      n_holes: 1
+      fill_value: 1.0
+    - name: cutout_mid_maxfill
+      type: cutout
+      patch_h: 18
+      patch_w: 18
+      n_holes: 1
+      fill_value: 1.0
+    - name: cutout_high_maxfill
+      type: cutout
+      patch_h: 22
+      patch_w: 22
+      n_holes: 1
+      fill_value: 1.0

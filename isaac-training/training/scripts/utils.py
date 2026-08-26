@@ -1,3 +1,4 @@
+import gc
 import torch
 import torch.nn as nn
 import wandb
@@ -17,17 +18,23 @@ def apply_depth_noise(depth: torch.Tensor, noise_type: str, **kwargs) -> torch.T
     if noise_type == "gaussian":
         return (depth + torch.randn_like(depth) * kwargs.get("sigma", 0.05)).clamp(0.0, 1.0)
     if noise_type == "dropout":
+        # fill_value=0.0 (default) mimics a false near-obstacle reading;
+        # fill_value=1.0 mimics a lost/no-return ray, which this env's own
+        # sensor pipeline (env_depth.py: nan_to_num(nan=depth_range), missed
+        # rays -> max range) treats as max range, not zero.
+        fill_value = kwargs.get("fill_value", 0.0)
         mask = (torch.rand_like(depth) > kwargs.get("rate", 0.15)).float()
-        return depth * mask
+        return depth * mask + fill_value * (1.0 - mask)
     if noise_type == "cutout":
         out = depth.clone()
         H, W = depth.shape[-2], depth.shape[-1]
         ph = kwargs.get("patch_h", 20)
         pw = kwargs.get("patch_w", 20)
+        fill_value = kwargs.get("fill_value", 0.0)
         for _ in range(kwargs.get("n_holes", 1)):
             y0 = int(torch.randint(0, max(1, H - ph + 1), (1,)))
             x0 = int(torch.randint(0, max(1, W - pw + 1), (1,)))
-            out[..., y0:y0 + ph, x0:x0 + pw] = 0.0
+            out[..., y0:y0 + ph, x0:x0 + pw] = fill_value
         return out
     if noise_type == "quantization":
         lvl = kwargs.get("levels", 16)
@@ -245,7 +252,20 @@ def evaluate(
 
     render_callback = RenderCallback(interval=2) if eval_video else None
 
-    with set_exploration_type(exploration_type):
+    # No gradients needed for an eval rollout — without this, every policy
+    # forward pass across all num_envs x max_episode_length steps builds and
+    # retains a full autograd graph (saved activations for backprop that will
+    # never happen), which at num_envs=350 x 2200 steps is tens of GB on top
+    # of the raw observation/action tensors and isn't reliably reclaimed by
+    # del/gc.collect()/empty_cache() alone between successive eval() calls —
+    # OOMs a 31GB GPU by the second noise condition in eval.py's loop.
+    # return_contiguous=False deliberately: True forces one single contiguous
+    # allocation for the whole trajectory (~14.8GB of depth alone at
+    # num_envs=350), which needs one contiguous free region and OOMs sooner
+    # under a fragmented pool than many smaller per-step allocations do —
+    # confirmed empirically (OOM moved from the 2nd condition to inside the
+    # 1st when tried at num_envs=350).
+    with torch.no_grad(), set_exploration_type(exploration_type):
         trajs = env.rollout(
             max_steps=env.max_episode_length,
             policy=eval_policy,
@@ -269,8 +289,15 @@ def evaluate(
         k: take_first_episode(v)
         for k, v in trajs[("next", "stats")].cpu().items()
     }
-    # Free the large rollout buffer (holds all obs/depth for all envs×steps) ASAP
+    # Free the large rollout buffer (holds all obs/depth for all envs×steps) ASAP.
+    # gc.collect() before empty_cache() matters here: at large num_envs (e.g.
+    # 350) x full episode length, this buffer is tens of GB, and without a
+    # hard collect, lingering Python-level refs (TensorDict internals) can
+    # keep the CUDA allocator from actually reclaiming it before the caller's
+    # next rollout starts.
     del trajs, done, first_done
+    gc.collect()
+    torch.cuda.synchronize()
     torch.cuda.empty_cache()
 
     info = {

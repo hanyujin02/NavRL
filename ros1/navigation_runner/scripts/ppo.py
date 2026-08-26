@@ -89,23 +89,51 @@ class ReachMapEncoderWrapper(nn.Module):
     """
 
     def __init__(self, encoder: nn.Module, embed_dim: int, is_bev: bool = False,
-                 freeze_encoder: bool = False):
+                 freeze_encoder: bool = False, projection_mlp: bool = True,
+                 freeze_bn: bool = True):
         super().__init__()
         self.encoder        = encoder
         self.embed_dim      = embed_dim
-        self.projection     = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim // 2),
-            nn.ReLU(),
-        )
+        if projection_mlp:
+            self.projection = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, embed_dim),
+                nn.ReLU(),
+                nn.Linear(embed_dim, embed_dim // 2),
+                nn.ReLU(),
+            )
+        else:
+            self.projection = nn.LayerNorm(embed_dim)
         self.is_bev         = is_bev
         self._freeze_encoder = freeze_encoder
+        # freeze_bn is only consulted when freeze_encoder=True (with
+        # freeze_encoder=False the encoder is fully trainable, BN included,
+        # regardless of this flag). freeze_bn=False lets a weight-frozen
+        # encoder's BatchNorm running_mean/var keep adapting to the live
+        # rollout data distribution during training, while conv/linear
+        # weights stay fixed (requires_grad=False below) — the opposite of
+        # the "_bnfrozen" naming convention used for earlier runs, which is
+        # freeze_bn=True (the default, and the only behavior this wrapper
+        # supported before this option existed).
+        self._freeze_bn = freeze_bn
+        if freeze_encoder and freeze_bn:
+            # Must happen at construction, not only in train() below.
+            # requires_grad=False freezes parameters but NOT BatchNorm's
+            # running_mean/var — those are buffers updated in forward() whenever
+            # the module is in train mode. Modules default to training=True, and
+            # SyncDataCollector deepcopies the whole policy at construction time
+            # (torchrl collectors.py: `self.policy = deepcopy(policy)`): params
+            # and buffers are shared tensors, but the `training` flag is per
+            # instance. The collector's copy therefore keeps whatever mode it was
+            # deepcopied in, and nothing ever calls .train()/.eval() on it again —
+            # so without this line the rollout path silently updated the "frozen"
+            # encoder's BN stats once per env step (measured: +64/iteration,
+            # running_var drifting 45-70% off the pretrained checkpoint by 50k).
+            self.encoder.eval()
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if self._freeze_encoder:
+        if self._freeze_encoder and self._freeze_bn:
             self.encoder.eval()   # keep frozen encoder in eval regardless of outer mode
         return self
 
@@ -132,7 +160,7 @@ class ReachMapEncoderWrapper(nn.Module):
         else:
             context, _ = self.encoder(x)
 
-        return self.projection(context)      # (N, embed_dim // 2)
+        return self.projection(context)      # (N, embed_dim // 2) if projection_mlp else (N, embed_dim)
 
 
 def _load_encoder_ckpt(encoder: nn.Module, ckpt_path: str, submodule: str = "") -> None:
@@ -278,7 +306,17 @@ def build_depth_encoder(cfg) -> nn.Module:
             p.requires_grad = False
         print(f"[NavRL] Encoder weights frozen.")
 
-    return ReachMapEncoderWrapper(enc, embed_dim, is_bev=is_bev, freeze_encoder=freeze)
+    # Only meaningful when freeze_encoder=True — see ReachMapEncoderWrapper's
+    # freeze_bn docstring/comment. Defaults to True (the only behavior this
+    # wrapper supported before this option existed) so existing configs are
+    # unaffected unless they explicitly set freeze_bn: false.
+    freeze_bn = getattr(cfg, "freeze_bn", True)
+    if freeze and not freeze_bn:
+        print(f"[NavRL] Encoder weights frozen, BatchNorm running stats NOT frozen (freeze_bn=false).")
+
+    projection_mlp = getattr(cfg, "projection_mlp", True)
+    return ReachMapEncoderWrapper(enc, embed_dim, is_bev=is_bev, freeze_encoder=freeze,
+                                   projection_mlp=projection_mlp, freeze_bn=freeze_bn)
 
 
 
@@ -340,26 +378,23 @@ class PPO(TensorDictModuleBase):
         self.gae = GAE(0.99, 0.95) # generalized adavantage esitmation
         self.critic_loss_fn = nn.HuberLoss(delta=10) # huberloss (L1+L2): https://pytorch.org/docs/stable/generated/torch.nn.HuberLoss.html
 
-        # Aux head: predict FOV-masked LiDAR distances from encoder features.
-        # Supervises the encoder (or projection when frozen) to retain obstacle info.
-        fov_key = ("agents", "observation", "lidar_fov")
-        if fov_key in list(observation_spec.keys(True, True)):
-            num_fov_rays = observation_spec[fov_key].shape[-1]
-            embed_out = getattr(cfg.feature_extractor, "embed_dim", 256) // 2
-            self.aux_head = nn.Linear(embed_out, num_fov_rays).to(self.device)
-            self.aux_loss_coeff = getattr(cfg.feature_extractor, "aux_loss_coeff", 0.1)
-            self.aux_optim = torch.optim.Adam(
-                self.aux_head.parameters(), lr=cfg.feature_extractor.learning_rate
-            )
-            self.has_aux_head = True
-            print(f"[NavRL] Aux LiDAR head: {embed_out} → {num_fov_rays} FOV rays (coeff={self.aux_loss_coeff})")
-        else:
-            self.has_aux_head = False
-
         # Optimizer
         self.feature_extractor_optim = torch.optim.Adam(self.feature_extractor.parameters(), lr=cfg.feature_extractor.learning_rate)
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor.learning_rate)
         self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic.learning_rate)
+
+        # LR decay: factor schedule over training iterations (one per train() call).
+        # Note: the iteration counter restarts at 0 when resuming from a checkpoint
+        # (only module weights are saved), so a resumed run re-warms from base lr.
+        self.lr_decay            = getattr(cfg, "lr_decay", None)
+        self.lr_decay_iters      = int(float(getattr(cfg, "lr_decay_iters", 40000)))  # float() first: YAML "4e4" parses as str
+        self.lr_decay_min_factor = float(getattr(cfg, "lr_decay_min_factor", 0.1))
+        self._lr_iter = 0
+        self._lr_optims = [self.feature_extractor_optim, self.actor_optim, self.critic_optim]
+        self._lr_base = [[g["lr"] for g in opt.param_groups] for opt in self._lr_optims]
+        if self.lr_decay:
+            print(f"[NavRL] LR decay: {self.lr_decay} over {self.lr_decay_iters} iters "
+                  f"(floor {self.lr_decay_min_factor}x)")
 
         # Dummy Input for nn lazymodule
         dummy_input = observation_spec.zero()
@@ -376,7 +411,7 @@ class PPO(TensorDictModuleBase):
         self.actor.apply(init_)
         self.critic.apply(init_)
 
-    def forward(self, tensordict):
+    def __call__(self, tensordict):
         self.feature_extractor(tensordict)
         self.actor(tensordict)
         self.critic(tensordict)
@@ -387,8 +422,29 @@ class PPO(TensorDictModuleBase):
         tensordict["agents", "action"] = actions_world
         return tensordict
 
-    def update(self, tensordict):
+    def _lr_decay_factor(self) -> float:
+        if not self.lr_decay:
+            return 1.0
+        t = min(self._lr_iter / max(self.lr_decay_iters, 1), 1.0)
+        m = self.lr_decay_min_factor
+        if self.lr_decay == "linear":
+            return 1.0 - (1.0 - m) * t
+        if self.lr_decay == "cosine":
+            import math
+            return m + 0.5 * (1.0 - m) * (1.0 + math.cos(math.pi * t))
+        raise ValueError(f"Unknown lr_decay '{self.lr_decay}' (use null, 'linear' or 'cosine')")
+
+    def train(self, tensordict):
         # tensordict: (num_env, num_frames, dim), batchsize = num_env * num_frames
+
+        # Apply LR decay before this iteration's updates
+        lr_factor = self._lr_decay_factor()
+        if self.lr_decay:
+            for opt, base_lrs in zip(self._lr_optims, self._lr_base):
+                for group, base in zip(opt.param_groups, base_lrs):
+                    group["lr"] = base * lr_factor
+        self._lr_iter += 1
+
         next_tensordict = tensordict["next"]
         with torch.no_grad():
             self.feature_extractor.eval()
@@ -445,7 +501,10 @@ class PPO(TensorDictModuleBase):
         infos = torch.stack(infos).to_tensordict()
         
         infos = infos.apply(torch.mean, batch_size=[])
-        return {k: v.item() for k, v in infos.items()}    
+        out = {k: v.item() for k, v in infos.items()}
+        out["lr_factor"] = lr_factor
+        out["actor_lr"] = self.actor_optim.param_groups[0]["lr"]
+        return out
 
     
     def _update(self, tensordict): # tensordict shape (batch_size, )
@@ -479,24 +538,13 @@ class PPO(TensorDictModuleBase):
         critic_loss_original = self.critic_loss_fn(ret, value)
         critic_loss = torch.max(critic_loss_clipped, critic_loss_original)
 
-        # Aux loss: predict FOV LiDAR distances from _cnn_feature (128-d encoder output).
-        # Gradient flows through the projection (always) and encoder backbone (if not frozen).
-        if self.has_aux_head:
-            cnn_feat = tensordict["_cnn_feature"]          # (batch, 1, embed_dim//2)
-            lidar_target = tensordict["agents", "observation", "lidar_fov"]  # (batch, 1, num_fov_rays)
-            aux_loss = self.aux_loss_coeff * F.mse_loss(self.aux_head(cnn_feat), lidar_target)
-        else:
-            aux_loss = 0.0
-
         # Total Loss
-        loss = entropy_loss + actor_loss + critic_loss + aux_loss
+        loss = entropy_loss + actor_loss + critic_loss
 
         # Optimize
         self.feature_extractor_optim.zero_grad()
         self.actor_optim.zero_grad()
         self.critic_optim.zero_grad()
-        if self.has_aux_head:
-            self.aux_optim.zero_grad()
         loss.backward()
 
         # Skip update if loss is NaN/Inf (e.g., caused by a bad batch)
@@ -518,8 +566,6 @@ class PPO(TensorDictModuleBase):
         self.feature_extractor_optim.step()
         self.actor_optim.step()
         self.critic_optim.step()
-        if self.has_aux_head:
-            self.aux_optim.step()
         explained_var = 1 - F.mse_loss(value, ret) / ret.var().clamp(min=1e-8)
         out = TensorDict({
             "actor_loss": actor_loss,
@@ -529,6 +575,4 @@ class PPO(TensorDictModuleBase):
             "critic_grad_norm": critic_grad_norm,
             "explained_var": explained_var,
         }, [])
-        if self.has_aux_head:
-            out["aux_loss"] = aux_loss.detach() if isinstance(aux_loss, torch.Tensor) else torch.tensor(0.)
         return out

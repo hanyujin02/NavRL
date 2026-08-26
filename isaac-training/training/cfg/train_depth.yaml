@@ -24,7 +24,7 @@ save_interval: 1000
 eval_video: false
 
 # Training Environment
-# (obstacle layout / map_range / num_obstacles live in cfg/env.yaml)
+# (obstacle layout / map_range live in cfg/env.yaml; num_obstacles overridden here)
 env:
   # 224 envs (was 350) to fit a ~16 GB GPU budget — camera/physics memory scales
   # linearly with num_envs. PPO batch size is preserved exactly via
@@ -32,6 +32,7 @@ env:
   num_envs: 350
   max_episode_length: 2200
   env_spacing: 8.0
+  num_obstacles: 300     # overrides env.yaml's env.num_obstacles (both currently 300)
   use_dijkstra_reward: false
   dijkstra_map_extent: 24.0       # covers randomized start/goal sides; terrain obstacles remain within map_range
   dijkstra_grid_resolution: 0.4   # metres/cell for the training-time potential map
@@ -58,7 +59,7 @@ viewer:
 
 wandb:
   project: NavRL-depth
-  name: depth_cnn_pretrain(dino)_attitude_depth
+  name: depth_cnn_pretrain(ae+raycast)_attitude_depth_seed0_nb
   entity: null            # null = use the logged-in user's default entity
   mode: online            # set to 'offline' to disable cloud sync
   run_id:
@@ -121,11 +122,12 @@ algo:
     obs_image_key: depth
     encoder_type: cnn
     # encoder_ckpt: null
-    encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-cnn-dino/latest.pt
+    encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-cnn-ae-raycast/latest.pt
     # encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-vit_20260705_022556/latest.pt
     encoder_ckpt_submodule: ""
     freeze_encoder: true
     embed_dim: 256
+    projection_mlp: true
     img_h: 60
     img_w: 80
     patch_size: 10
