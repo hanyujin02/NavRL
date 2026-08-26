@@ -17,7 +17,11 @@ class policy_server:
         self.raycast_vres = ((self.cfg.sensor.lidar_vfov[1] - self.cfg.sensor.lidar_vfov[0]))/(self.cfg.sensor.lidar_vbeams - 1) * np.pi/180.0
         self.raycast_hres = self.cfg.sensor.lidar_hres * np.pi/180.0
         self.policy = self.init_model()
-        self.policy.eval()
+        # PPO overrides train() for the RL update step, so it collides with
+        # nn.Module.eval() (which calls self.train(False)) — eval submodules
+        # directly instead, matching isaac-training/training/scripts/eval.py.
+        for m in [self.policy.feature_extractor, self.policy.actor, self.policy.critic]:
+            m.eval()
 
     def init_model(self):
         # must match training env.attitude_obs (state 8 -> 10 dims with body roll/pitch)

@@ -10,7 +10,7 @@
     <arg name="goal_topic"    default="/move_base_simple/goal" />
 
     <!-- Checkpoint filename (inside scripts/ckpts/) -->
-    <arg name="checkpoint"    default="checkpoint_34000(best).pt" />
+    <arg name="checkpoint"    default="checkpoint_16000.pt" />
 
     <!-- Visualization -->
     <arg name="rviz"          default="false" />

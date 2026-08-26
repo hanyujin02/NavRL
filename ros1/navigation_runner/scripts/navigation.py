@@ -79,7 +79,11 @@ class Navigation:
         self.goal_vis_pub = rospy.Publisher("rl_navigation/goal", MarkerArray, queue_size=10)
 
         self.policy = self.init_model()
-        self.policy.eval()
+        # PPO overrides train() for the RL update step, so it collides with
+        # nn.Module.eval() (which calls self.train(False)) — eval submodules
+        # directly instead, matching isaac-training/training/scripts/eval.py.
+        for m in [self.policy.feature_extractor, self.policy.actor, self.policy.critic]:
+            m.eval()
 
         # safety thread
         self.safety_stop = False

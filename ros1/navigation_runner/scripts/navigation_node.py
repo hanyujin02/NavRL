@@ -12,7 +12,7 @@ import os
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts/cfg")
 @hydra.main(config_path=FILE_PATH, config_name="deploy", version_base=None)
 def main(cfg):
-    rospy.init_node("navigation_node", anonymous=True)
+    rospy.init_node("navigation_node")
     nav = Navigation(cfg)
     nav.run()
     rospy.spin()

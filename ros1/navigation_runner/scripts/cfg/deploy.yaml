@@ -6,6 +6,11 @@ defaults:
 # Compute device
 device: "cuda:0"
 
+# Must match the training config of the loaded checkpoint:
+# true = state input has body roll/pitch appended (10 dims), false = 8 dims
+env:
+  attitude_obs: true
+
 # Depth camera (must match your sensor and the trained checkpoint)
 sensor:
   depth_range: 5.0     # max sensing range in metres

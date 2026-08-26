@@ -109,7 +109,11 @@ class Navigation(Node):
         ckpt_file = self.get_parameter('checkpoint_file').get_parameter_value().string_value
         self.get_logger().info(f"[navRunner]: Checkpoint: {ckpt_file}.")
         self.policy = self.init_model(ckpt_file)
-        self.policy.eval()
+        # PPO overrides train() for the RL update step, so it collides with
+        # nn.Module.eval() (which calls self.train(False)) — eval submodules
+        # directly instead, matching isaac-training/training/scripts/eval.py.
+        for m in [self.policy.feature_extractor, self.policy.actor, self.policy.critic]:
+            m.eval()
 
 
     def init_model(self, ckpt_file):
