@@ -13,7 +13,7 @@ from omni.isaac.orbit.utils import configclass
 import oriented_obstacles
 from omni_drones.utils.torch import euler_to_quaternion, quat_axis
 from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, RayCasterCamera, RayCasterCameraCfg, patterns
-from utils import vec_to_new_frame, vec_to_world, construct_input
+from utils import vec_to_new_frame, vec_to_world, construct_input, apply_depth_noise
 import omni.isaac.core.utils.prims as prim_utils
 import omni.isaac.orbit.sim as sim_utils
 import omni.isaac.orbit.utils.math as math_utils
@@ -167,6 +167,14 @@ class NavigationEnv(IsaacEnv):
             self.prev_drone_pos = torch.zeros(self.num_envs, 1, 3)
         self._depth_saved = False
         self._bev_saved = False
+
+        # Disturbance: sensor-input-latency ring buffers (lazily allocated on
+        # first use in _apply_sensor_latency — stay None/unused entirely when
+        # disturbance.enabled is false, the default).
+        self._depth_history = None
+        self._dyn_obs_state_history = None
+        self._state_history = None
+        self._sensor_hist_write_ptr = 0
 
         # 3D policy: drop the per-episode height-band penalty and raise the
         # termination ceiling so the policy can fly over/under obstacles.
@@ -497,6 +505,15 @@ class NavigationEnv(IsaacEnv):
 
         self.cbf_distance_field = torch.as_tensor(dist, dtype=torch.float32, device=self.device)
         self.cbf_grad_field = torch.as_tensor(grad, dtype=torch.float32, device=self.device)
+        # DEBUG: rules out a one-time grid-construction bug (vs. a per-step
+        # runtime issue) — if these ever fire, the problem is in
+        # _compute_obstacle_distance_field_np / the gradient computation
+        # above, not in the per-step sampling/reward math below.
+        n_nan_dist = torch.isnan(self.cbf_distance_field).sum().item()
+        n_nan_grad = torch.isnan(self.cbf_grad_field).sum().item()
+        if n_nan_dist or n_nan_grad:
+            print(f"[NavRL][DEBUG] CBF grid has NaN at construction time! "
+                  f"distance_field NaN count={n_nan_dist}, grad_field NaN count={n_nan_grad}")
         print(
             "[NavRL] CBF safety reward enabled: "
             f"margin={self.cbf_safe_margin:.2f}m, gamma={self.cbf_gamma:.2f}"
@@ -615,12 +632,27 @@ class NavigationEnv(IsaacEnv):
         return dist
 
     def _compute_obstacle_distance_field_np(self):
+        # dtype=float64 (not float32) is load-bearing: `new_dist` on the heap
+        # below is a Python/numpy float64 (np.sqrt(2.0) is float64), but
+        # `dist[nx, ny] = new_dist` silently downcasts to whatever dtype
+        # `dist` is. With float32, the stored value differs in its last bits
+        # from the float64 value still sitting on the heap, so the staleness
+        # check `curr != dist[x, y]` below spuriously evaluates True for any
+        # cell reached via a diagonal (sqrt(2)-involving) step — the entry
+        # gets treated as stale and discarded, silently truncating the flood
+        # fill after just 1-2 hops in most directions (verified: on a 120x120
+        # grid this left ~62% of cells at inf, which downstream turned into
+        # inf/inf = NaN in the CBF gradient field, and NaN return/loss
+        # whenever a drone's cell fell in the unreached region). Keeping
+        # `dist` at the heap's own precision (float64) makes curr and
+        # dist[x, y] bit-identical for the canonical entry, so the check
+        # only discards genuinely-stale (superseded) entries as intended.
         grid_h, grid_w = self.dijkstra_shape
-        dist = np.full((grid_h, grid_w), np.inf, dtype=np.float32)
+        dist = np.full((grid_h, grid_w), np.inf, dtype=np.float64)
         heap = []
         obstacle_cells = np.argwhere(self.cbf_occupancy)
         if obstacle_cells.size == 0:
-            return np.full((grid_h, grid_w), self.dijkstra_extent * 2.0, dtype=np.float32)
+            return np.full((grid_h, grid_w), self.dijkstra_extent * 2.0, dtype=np.float64)
 
         for x, y in obstacle_cells:
             dist[x, y] = 0.0
@@ -669,6 +701,24 @@ class NavigationEnv(IsaacEnv):
         potential = self.dijkstra_potential[env_idx, ix, iy].unsqueeze(-1)
         euclidean = (self.target_pos - pos).norm(dim=-1)
         return torch.where(in_bounds.unsqueeze(-1), potential, euclidean)
+
+    def _debug_check_nan(self, name: str, tensor: torch.Tensor):
+        """Temporary debug instrumentation for the CBF-reward NaN investigation.
+        Prints which term first went NaN, for how many envs, and those envs'
+        drone positions — so the *next* run pinpoints the exact term instead
+        of guessing from the final reward/return. Remove once root-caused.
+        """
+        if not torch.isnan(tensor).any():
+            return
+        per_env_bad = torch.isnan(tensor).any(dim=tuple(range(1, tensor.dim()))) if tensor.dim() > 1 else torch.isnan(tensor)
+        bad_idx = per_env_bad.nonzero(as_tuple=True)[0]
+        pos = self.root_state[bad_idx, 0, :3] if bad_idx.numel() else None
+        print(
+            f"[NavRL][DEBUG] NaN first seen in '{name}' — {bad_idx.numel()} env(s), "
+            f"e.g. envs {bad_idx[:5].tolist()}"
+            f"{' ...' if bad_idx.numel() > 5 else ''}, "
+            f"drone pos (first 5): {pos[:5].tolist() if pos is not None else None}"
+        )
 
     def _sample_cbf_distance_and_grad(self, pos: torch.Tensor):
         xy = pos[..., :2].squeeze(1)
@@ -829,7 +879,15 @@ class NavigationEnv(IsaacEnv):
         self.height_range[env_ids, 0, 1] = torch.max(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
         self._update_dijkstra_fields(env_ids)
 
-        self.stats[env_ids] = 0.  
+        # Disturbance: zero the per-env slice of any allocated sensor-latency
+        # ring buffer so a fresh episode doesn't replay another episode's
+        # stale/noisy history. No-op (buffers stay None) when disturbance's
+        # input-latency fields are never used.
+        for buf in (self._depth_history, self._dyn_obs_state_history, self._state_history):
+            if buf is not None:
+                buf[env_ids] = 0.
+
+        self.stats[env_ids] = 0.
         
     # ------------------------------------------------------------------ data collection
     def _collect_init_dir(self):
@@ -888,6 +946,103 @@ class NavigationEnv(IsaacEnv):
         self.depth_camera.update(self.dt)
         self.lidar.update(self.dt)
     
+    @staticmethod
+    def _random_mask_and_compact_prefix_prob(
+        dyn_obs_mask: torch.Tensor,
+        closest_dyn_obs_idx: torch.Tensor,
+        p: float,
+    ):
+        """Simulate per-obstacle missed detections (disturbance.dyn_obs_miss_prob),
+        ported verbatim from NavRL++ (env.py: random_mask_and_compact_prefix_prob_vec).
+
+        For each of the K nearest-obstacle slots already inside range
+        (`~dyn_obs_mask`), independently Bernoulli-drop it with probability
+        `p`, then left-pack the surviving slots to the front (stable order)
+        and mark the padded tail as masked — mimicking a sensor that
+        randomly fails to detect some of the obstacles it would otherwise see,
+        while keeping the fixed-K tensor shape downstream code expects.
+        """
+        device = dyn_obs_mask.device
+        B, K = dyn_obs_mask.shape
+        available = ~dyn_obs_mask
+        rnd = torch.rand(B, K, device=device)
+        newly_masked = (rnd < p) & available
+        keep_mask = available & ~newly_masked
+        idxs = torch.arange(K, device=device).unsqueeze(0).expand(B, K)
+        key = (~keep_mask).int() * (K + 1) + idxs
+        order = torch.argsort(key, dim=1, descending=False)
+        packed_idx = closest_dyn_obs_idx.gather(1, order)
+        num_kept = keep_mask.sum(dim=1)
+        cutoff = idxs >= num_kept.unsqueeze(1)
+        new_idx = packed_idx.clone()
+        new_idx[cutoff] = 0
+        new_mask = cutoff
+        return new_mask, new_idx
+
+    def _resolve_latency_step(self, latency_cfg) -> int:
+        """seconds (float, fixed) or [low, high] (uniform-random, resampled
+        every call) -> a ring-buffer step count, matching NavRL++'s formula."""
+        if isinstance(latency_cfg, float) or isinstance(latency_cfg, int):
+            return int(latency_cfg / self.dt) + 1
+        low = int(latency_cfg[0] / self.dt) + 1
+        high = int(latency_cfg[1] / self.dt) + 1
+        return int(np.random.randint(low=low, high=high + 1))
+
+    def _apply_sensor_latency(self, depth_obs, dyn_obs_states, drone_state):
+        """Per-sensor input-latency ring buffers (disturbance.{depth,dyn_obs,state}_input_latency),
+        ported from NavRL++'s no-history-stacking branch (env.py:1148-1202) —
+        a single re-sampled-per-step delayed frame per signal, not NavRL++'s
+        T-frame history-stacked window (that's specific to feeding sequences
+        into their transformer; this pipeline's obs stay single-frame
+        regardless of algo.network_type). No-op unless enabled and the
+        relevant field is non-zero. Skipped entirely for BEV observations
+        (depth_obs is None) — BEV latency isn't ported (out of scope).
+
+        Simplification vs. NavRL++: no per-env "not enough history yet"
+        fallback (see _apply_action_disturbance in ppo.py for the same
+        rationale) — buffers are zero-initialized and read unconditionally
+        once a latency is configured, affecting only the first ~0.5s of a run.
+        """
+        dcfg = getattr(self.cfg, "disturbance", None)
+        if dcfg is None or not getattr(dcfg, "enabled", False):
+            return depth_obs, dyn_obs_states, drone_state
+
+        def _has_latency(field_name):
+            val = getattr(dcfg, field_name, 0.0)
+            return any(val) if not isinstance(val, (float, int)) else val != 0.0
+
+        want_depth = depth_obs is not None and _has_latency("depth_input_latency")
+        want_dyn = _has_latency("dyn_obs_input_latency")
+        want_state = _has_latency("state_input_latency")
+        if not (want_depth or want_dyn or want_state):
+            return depth_obs, dyn_obs_states, drone_state
+
+        hist_len = int(0.5 / self.dt) + 1
+
+        def _write_and_read(buf_attr, current, latency_field):
+            buf = getattr(self, buf_attr)
+            if buf is None or buf.shape[0] != current.shape[0] or buf.shape[2:] != current.shape[1:]:
+                buf = torch.zeros(current.shape[0], hist_len, *current.shape[1:], device=current.device)
+                setattr(self, buf_attr, buf)
+            j = self._sensor_hist_write_ptr % hist_len
+            buf[:, j] = current.detach()
+            base = torch.arange(hist_len, device=current.device)
+            idx = (base + (self._sensor_hist_write_ptr + 1) % hist_len) % hist_len  # oldest to newest
+            step = self._resolve_latency_step(getattr(dcfg, latency_field))
+            step = min(step, hist_len)
+            delayed_idx = idx[-step]
+            return buf[:, delayed_idx].reshape(current.shape)
+
+        if want_depth:
+            depth_obs = _write_and_read("_depth_history", depth_obs, "depth_input_latency")
+        if want_dyn:
+            dyn_obs_states = _write_and_read("_dyn_obs_state_history", dyn_obs_states, "dyn_obs_input_latency")
+        if want_state:
+            drone_state = _write_and_read("_state_history", drone_state, "state_input_latency")
+        self._sensor_hist_write_ptr += 1
+
+        return depth_obs, dyn_obs_states, drone_state
+
     # get current states/observation
     def _compute_state_and_obs(self):
         # Sanitize physics state: Isaac Sim can produce NaN velocities/positions for one
@@ -951,6 +1106,13 @@ class NavigationEnv(IsaacEnv):
             # depth_obs_divisor (== depth_range by default → [0, 1]; a larger
             # divisor rescales the frozen encoder's input, see __init__).
             depth_norm = depth_data / self.depth_obs_divisor   # (N, 1, H, W)
+
+            dcfg = getattr(self.cfg, "disturbance", None)
+            if dcfg is not None and getattr(dcfg, "enabled", False) and getattr(dcfg, "depth_noise", None) is not None:
+                noise_kwargs = dict(dcfg.depth_noise)
+                noise_type = noise_kwargs.pop("type")
+                depth_norm = apply_depth_noise(depth_norm, noise_type, **noise_kwargs)
+
             img_obs = depth_norm
 
             if not self._depth_saved:
@@ -1021,8 +1183,24 @@ class NavigationEnv(IsaacEnv):
             _, closest_dyn_obs_idx = torch.topk(dyn_obs_distance_2d, self.cfg.algo.feature_extractor.dyn_obs_num, dim=1, largest=False) # pick top N closest obstacle index
             dyn_obs_range_mask = dyn_obs_distance_2d.gather(1, closest_dyn_obs_idx) > self.lidar_range
 
+            # Disturbance: simulate missed dynamic-obstacle detections (drop
+            # each in-range obstacle slot independently w.p. dyn_obs_miss_prob,
+            # left-pack survivors). No-op unless enabled and prob != 0.
+            dcfg = getattr(self.cfg, "disturbance", None)
+            if dcfg is not None and getattr(dcfg, "enabled", False) and getattr(dcfg, "dyn_obs_miss_prob", 0.0) != 0.0:
+                dyn_obs_range_mask, closest_dyn_obs_idx = self._random_mask_and_compact_prefix_prob(
+                    dyn_obs_range_mask, closest_dyn_obs_idx, dcfg.dyn_obs_miss_prob
+                )
+
             # relative distance of obstacles in the goal frame
             closest_dyn_obs_rpos = torch.gather(dyn_obs_rpos_expanded, 1, closest_dyn_obs_idx.unsqueeze(-1).expand(-1, -1, 3))
+            if dcfg is not None and getattr(dcfg, "enabled", False) and getattr(dcfg, "dyn_obs_pos_std", 0.0) != 0.0:
+                # Disturbance: per-axis Gaussian noise on relative obstacle
+                # position, applied before goal-frame rotation (matches NavRL++).
+                closest_dyn_obs_rpos = closest_dyn_obs_rpos + torch.normal(
+                    mean=torch.zeros_like(closest_dyn_obs_rpos),
+                    std=dcfg.dyn_obs_pos_std * torch.ones_like(closest_dyn_obs_rpos),
+                )
             closest_dyn_obs_rpos_g = vec_to_new_frame(closest_dyn_obs_rpos, target_dir_2d) 
             closest_dyn_obs_rpos_g[dyn_obs_range_mask] = 0. # exclude out of range obstacles
             closest_dyn_obs_distance = closest_dyn_obs_rpos.norm(dim=-1, keepdim=True)
@@ -1032,6 +1210,13 @@ class NavigationEnv(IsaacEnv):
 
             # b. Velocity in the goal frame for the dynamic obstacles
             closest_dyn_obs_vel = self.dyn_obs_vel[closest_dyn_obs_idx]
+            if dcfg is not None and getattr(dcfg, "enabled", False) and getattr(dcfg, "dyn_obs_vel_std", 0.0) != 0.0:
+                # Disturbance: per-axis Gaussian noise on relative obstacle
+                # velocity, applied before goal-frame rotation (matches NavRL++).
+                closest_dyn_obs_vel = closest_dyn_obs_vel + torch.normal(
+                    mean=torch.zeros_like(closest_dyn_obs_vel),
+                    std=dcfg.dyn_obs_vel_std * torch.ones_like(closest_dyn_obs_vel),
+                )
             closest_dyn_obs_vel[dyn_obs_range_mask] = 0.
             closest_dyn_obs_vel_g = vec_to_new_frame(closest_dyn_obs_vel, target_dir_2d) 
 
@@ -1068,6 +1253,18 @@ class NavigationEnv(IsaacEnv):
             dyn_obs_states = torch.zeros(self.num_envs, 1, self.cfg.algo.feature_extractor.dyn_obs_num, 10, device=self.cfg.device)
             dynamic_collision = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.cfg.device)
             
+        # Disturbance: per-sensor input latency (depth/dyn-obstacle/state),
+        # applied last so every signal fed into the ring buffer already has
+        # this step's noise baked in (a delayed read later replays that exact
+        # noisy sample). No-op unless enabled and a latency field is set.
+        # BEV observations don't go through the depth-latency buffer (out of scope).
+        _depth_for_latency = None if self.use_bev else img_obs
+        _depth_delayed, dyn_obs_states, drone_state = self._apply_sensor_latency(
+            _depth_for_latency, dyn_obs_states, drone_state
+        )
+        if not self.use_bev:
+            img_obs = _depth_delayed
+
         # -----------------Network Input Final--------------
         img_key = "bev" if self.use_bev else "depth"
 
@@ -1098,12 +1295,18 @@ class NavigationEnv(IsaacEnv):
         # The reward only penalizes violations, matching CBF reward shaping as a soft constraint.
         if self.use_cbf_safety_reward:
             cbf_dist, cbf_grad = self._sample_cbf_distance_and_grad(self.root_state[..., :3])
+            self._debug_check_nan("cbf_dist", cbf_dist)
+            self._debug_check_nan("cbf_grad", cbf_grad)
             cbf_h = cbf_dist - self.cbf_safe_margin
+            self._debug_check_nan("cbf_h", cbf_h)
             cbf_hdot = (cbf_grad * vel_w_safe[..., :2].squeeze(1)).sum(dim=-1, keepdim=True)
+            self._debug_check_nan("cbf_hdot", cbf_hdot)
             cbf_condition = cbf_hdot + self.cbf_gamma * cbf_h
+            self._debug_check_nan("cbf_condition", cbf_condition)
             reward_safety_static = self.cbf_reward_scale * cbf_condition.clamp(
                 min=-self.cbf_reward_clip, max=0.0
             )
+            self._debug_check_nan("reward_safety_static", reward_safety_static)
         else:
             reward_safety_static = torch.log((self.lidar_range - self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
 
@@ -1111,13 +1314,18 @@ class NavigationEnv(IsaacEnv):
         if (self.cfg.env_dyn.num_obstacles != 0):
             if self.use_cbf_safety_reward:
                 dyn_grad = -closest_dyn_obs_rpos / closest_dyn_obs_rpos.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                self._debug_check_nan("dyn_grad", dyn_grad)
                 dyn_rel_vel = vel_w_safe - closest_dyn_obs_vel
                 dyn_h = closest_dyn_obs_distance_reward - self.cbf_safe_margin
+                self._debug_check_nan("dyn_h", dyn_h)
                 dyn_hdot = (dyn_grad * dyn_rel_vel).sum(dim=-1)
+                self._debug_check_nan("dyn_hdot", dyn_hdot)
                 dyn_condition = dyn_hdot + self.cbf_gamma * dyn_h
+                self._debug_check_nan("dyn_condition", dyn_condition)
                 reward_safety_dynamic = self.cbf_reward_scale * dyn_condition.clamp(
                     min=-self.cbf_reward_clip, max=0.0
                 ).mean(dim=-1, keepdim=True)
+                self._debug_check_nan("reward_safety_dynamic", reward_safety_dynamic)
             else:
                 reward_safety_dynamic = torch.log((closest_dyn_obs_distance_reward).clamp(min=1e-6, max=self.lidar_range)).mean(dim=-1, keepdim=True)
 

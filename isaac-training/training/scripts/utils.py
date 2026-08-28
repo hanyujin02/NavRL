@@ -1,4 +1,5 @@
 import gc
+import math
 import torch
 import torch.nn as nn
 import wandb
@@ -138,6 +139,122 @@ def make_mlp(num_units):
         layers.append(nn.LeakyReLU())
         layers.append(nn.LayerNorm(n))
     return nn.Sequential(*layers)
+
+
+# ── Transformer feature-extractor option (algo.network_type: transformer) ───
+# Ported from NavRL++ (utils.py: SinusoidalPE1D, BuildTokens, TransformerBackbone).
+# All three are sensor-agnostic: the adapters are plain make_mlp([d_model])
+# (LazyLinear, so any input width works) and the transformer has no fixed
+# sequence length or mask. Here the "static" token is the depth encoder's
+# output (_cnn_feature) instead of NavRL++'s from-scratch lidar CNN — a
+# drop-in swap, since static_adapter only ever sees a (B, D) vector either way.
+
+class SinusoidalPE1D(nn.Module):
+    def __init__(self, d_model, max_len):
+        super().__init__()
+        pos = torch.arange(max_len).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("table", pe, persistent=False)
+
+    def forward(self, L):
+        return self.table[:L]  # (time, d_model)
+
+
+class BuildTokens(nn.Module):
+    """Tokenizes static (vision), state, and (optionally) dynamic-obstacle
+    streams for TransformerBackbone: 1 CLS + 1 static + T state [+ T dynamic]
+    tokens.
+
+    Adaptation vs. NavRL++: this pipeline's `dynamic_obstacle`/`state`
+    observations are single-frame (no env-side history stacking), unlike
+    NavRL++'s T=5 windowed history. `dynamic_obstacle` already carries a
+    size-1 placeholder frame dim (T=1) from env_depth.py's `.unsqueeze(1)`,
+    so it needs no change; `state` (env_depth.py's `drone_state`, shape
+    (B, D)) is unsqueezed to (B, 1, D) here so both streams satisfy the same
+    (B, T, ...) contract PE/type-embedding expect. With T=1 the temporal PE
+    degenerates to a single (harmless) position.
+
+    use_dynamic=False (for env_dyn.num_obstacles=0 / dyn_obs_num=0 configs,
+    where dynamic_obstacle is otherwise an uninformative all-zero tensor)
+    drops the dynamic-obstacle token and its adapter entirely — one fewer
+    token, one fewer set of dead weights, not just a zeroed-out input.
+    """
+
+    def __init__(self, d_model, max_T, use_dynamic: bool = True):
+        super().__init__()
+        self.d_model = d_model
+        self.use_dynamic = use_dynamic
+
+        self.static_adapter = make_mlp([d_model])
+        self.state_adapter = make_mlp([d_model])
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+        # modalities: CLS, static, state [, dynamic]
+        vocab = 4 if use_dynamic else 3
+        self.type_embedding = nn.Embedding(vocab, d_model)
+        nn.init.trunc_normal_(self.type_embedding.weight, std=0.02)
+
+        self.time_pe = SinusoidalPE1D(d_model, max_T)
+
+        if use_dynamic:
+            self.dyn_adapter = make_mlp([d_model])
+
+    def forward(self, static, state, dynamic=None):
+        static = static.unsqueeze(1)
+        if state.dim() == 2:
+            state = state.unsqueeze(1)   # (B, D) -> (B, 1, D), single-frame adaptation
+
+        static_token = self.static_adapter(static)
+        state_token = self.state_adapter(state)
+        state_token = state_token + self.time_pe(state.shape[1])[None, :, :]
+
+        B = static.shape[0]
+        cls_token = self.cls_token.expand(B, 1, -1) + self.type_embedding.weight[0].view(1, 1, -1)
+        static_token = static_token + self.type_embedding.weight[1].view(1, 1, -1)
+        state_token = state_token + self.type_embedding.weight[2].view(1, 1, -1)
+
+        if self.use_dynamic:
+            dynamic = dynamic.reshape(dynamic.shape[0], dynamic.shape[1], -1)
+            T = dynamic.shape[1]
+            dynamic_token = self.dyn_adapter(dynamic)
+            dynamic_token = dynamic_token + self.time_pe(T)[None, :, :]
+            dynamic_token = dynamic_token + self.type_embedding.weight[3].view(1, 1, -1)
+            tokens = torch.cat([cls_token, static_token, state_token, dynamic_token], dim=-2)
+        else:
+            tokens = torch.cat([cls_token, static_token, state_token], dim=-2)
+        return tokens
+
+
+class TransformerBackbone(nn.Module):
+    def __init__(
+            self,
+            d_model=64,
+            nhead=4,
+            num_layers=4,
+            dim_feedforward=1024,
+            dropout=0.1,
+            norm_first=True,
+    ):
+        super().__init__()
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=norm_first,
+            activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+
+    def forward(self, x):
+        return self.encoder(x)[:, 0, :]
+
 
 class IndependentNormal(torch.distributions.Independent):
     arg_constraints = {"loc": torch.distributions.constraints.real, "scale": torch.distributions.constraints.positive} 

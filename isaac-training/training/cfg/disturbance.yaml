@@ -1,0 +1,47 @@
+# Sim-to-real domain-randomization / robustness system, ported from NavRL++
+# (/home/hanyujin/NavRL-plus-plus-main/isaac-training/training/cfg/disturbance.yaml).
+#
+# `enabled: false` (default) reproduces the current depth-encoder-comparison
+# pipeline's behavior exactly — every mechanism below is also individually
+# gated on its own magnitude being non-zero/non-null, so turning `enabled`
+# on and leaving a field at its off-value (0.0 / null / [0.0, 0.0]) is a
+# no-op for that one mechanism. This lets a "robust" training profile
+# (see train_depth_robust.yaml) turn the whole system on without disturbing
+# the plain comparison configs (train_depth.yaml) that don't reference it.
+disturbance:
+  enabled: false
+
+  # Depth-camera sensor noise, applied once per step right after the raw
+  # depth read (env_depth.py). Reuses apply_depth_noise() from utils.py —
+  # the same function/vocabulary used by eval_noise.yaml's offline
+  # robustness sweep — instead of introducing a second noise schema.
+  # null disables it; otherwise a dict of kwargs passed straight through,
+  # e.g. {type: gaussian, sigma: 0.02} or {type: dropout, rate: 0.05}.
+  depth_noise: null
+
+  # Dynamic-obstacle sensing noise (NavRL++ env.py:1006-1034). Only has any
+  # effect when env_dyn.num_obstacles != 0 — with dynamic obstacles off
+  # (the current comparison configs' default) there is nothing to perturb.
+  dyn_obs_pos_std: 0.0     # metres, per-axis Gaussian noise on relative position
+  dyn_obs_vel_std: 0.0     # m/s, per-axis Gaussian noise on relative velocity
+  dyn_obs_miss_prob: 0.0   # per-obstacle Bernoulli drop probability (simulated missed detections)
+
+  # Per-sensor input latency: seconds, [low, high] uniform-random, resampled
+  # every step (matches NavRL++). A scalar is also accepted as a fixed delay.
+  depth_input_latency: [0.0, 0.0]
+  dyn_obs_input_latency: [0.0, 0.0]
+  state_input_latency: [0.0, 0.0]
+
+  # Action-side latency (world-frame velocity command delay before the
+  # controller sees it) and additive Gaussian noise on that command.
+  action_latency: [0.0, 0.0]         # seconds, [low, high] uniform-random, resampled every step
+  action_gaussian_std: 0.0           # m/s, per-axis
+  action_noise_threshold: 0.0        # only inject action noise when |commanded speed| exceeds this
+
+  # Velocity-controller gain mismatch (LeePositionController), simulating an
+  # imperfectly-tuned/identified low-level controller. Unlike every field
+  # above, this is NOT gated by `enabled` (matches NavRL++: it's read
+  # unconditionally by train.py) — its own no-op value is 0.0.
+  # Scalar -> fixed multiplicative bias: vel_gain *= (1 + vel_gain_factor).
+  # [low, high] -> fresh per-call per-axis-per-env random factor in that range.
+  vel_gain_factor: 0.0

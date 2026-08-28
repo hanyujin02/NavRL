@@ -1,8 +1,12 @@
 defaults:
-  - _self_
   - drone
   - ppo
   - sim
+  - _self_      # _self_ must be last so this file's overrides win over ppo.yaml's
+                # defaults (e.g. obs_image_key: depth) — matches train_depth.yaml's
+                # pattern. Previously _self_ was first, which silently let
+                # ppo.yaml's obs_image_key: depth default override this file
+                # (env_lidar.py only ever produces a "lidar" obs key, not "depth").
 
 checkpoint: null        # path to .pt file to resume from; null = train from scratch
 
@@ -17,15 +21,27 @@ save_interval: 1000
 
 # Training Environment
 env:
-  num_envs: 2 # Number of drones for training
+  num_envs: 512 # Number of drones for training
   max_episode_length: 2200
   env_spacing: 8.0 
   num_obstacles: 350
 
 env_dyn:
-  num_obstacles: 80 # set to zero if static env is needed
+  num_obstacles: 0  # static-only (was 80) — pure-static lidar+transformer config
   vel_range: [0.5, 1.5]
   local_range: [5.0, 5.0, 4.5]
+
+# Pure-static lidar + transformer network_type. algo.feature_extractor.dyn_obs_num
+# stays at ppo.yaml's default (0), so BuildTokens automatically drops the
+# dynamic-obstacle token (see ppo.py's transformer branch / utils.py's
+# BuildTokens use_dynamic flag) — no dead all-zero token, consistent with
+# env_dyn.num_obstacles: 0 above.
+algo:
+  feature_extractor:
+    obs_image_key: lidar   # required override — ppo.yaml's default is now "depth"
+                            # (set for the depth-camera branch); env_lidar.py's
+                            # observation dict only has a "lidar" key.
+  network_type: transformer
 
 viewer:
   eye: [0., 40., 40.]
@@ -40,7 +56,7 @@ sensor:
   lidar_hres: 10.           # degrees
 
 wandb:
-  project: NavRL-depth
+  project: NavRL-depth-deploy
   name: navigation_training(lidar)
   entity: null            # null = use the logged-in user's default entity
   mode: online # online

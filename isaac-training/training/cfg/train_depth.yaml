@@ -1,18 +1,25 @@
 defaults:
-  - drone       # sensor.depth_range/height/width/focal_length/horizontal_aperture
-  - ppo         # algo settings + feature_extractor encoder options
+  - drone         # sensor.depth_range/height/width/focal_length/horizontal_aperture
+  - ppo           # algo settings + feature_extractor encoder options
   - sim
-  - env         # static environment / obstacle config (map_range, obstacle_mode, num_obstacles, ...)
-  - _self_      # train_depth.yaml overrides take highest priority
+  - env           # static environment / obstacle config (map_range, obstacle_mode, num_obstacles, ...)
+  - disturbance   # sim-to-real domain randomization; disabled by default (disturbance.enabled: false)
+  - _self_        # train_depth.yaml overrides take highest priority
 
 env_script: env_depth   # selects training/scripts/env_depth.py
 # checkpoint: /home/hanyujin/NavRL/isaac-training/wandb/run-20260625_132712-ofte5ogv/files/checkpoint_10000.pt        # path to .pt file to resume from; null = train from scratch
 # checkpoint: /home/hanyujin/ReachMap/NavRL/isaac-training/wandb/run-20260626_144813-7lu8r8pv/files/checkpoint_34000.pt        # path to .pt file to resume from; null = train from scratch
-checkpoint: null
+# Resuming depth_cnn_cbf (run-20260827_214408-2kv09jed), which stopped at
+# iter 26000/~26786 (97% of the old max_frame_num=6e8 target) still climbing
+# (eval SR ema 0.654->0.687 in its last two evals) — only weights are
+# restored (optimizer/iteration count restart at 0, see train.py), and
+# max_frame_num below is raised to 12e8 so this actually gets a full
+# additional training budget instead of just finishing the last ~3%.
+checkpoint: /home/hanyujin/ReachMap/NavRL/isaac-training/wandb/run-20260828_115509-vww9fjmw/files/best.pt        # path to .pt file to resume from; null = train from scratch
 
 headless: True
 device: "cuda:0"
-seed: 0
+seed: 1
 
 # Total Training Length
 max_frame_num: 12e8
@@ -21,7 +28,7 @@ save_interval: 1000
 
 # Skip eval video recording (RTX viewer pipeline + ~2.5 GB frame buffer).
 # Depth sensors and all eval metrics are unaffected; only the wandb mp4 is dropped.
-eval_video: false
+eval_video: true
 
 # Training Environment
 # (obstacle layout / map_range live in cfg/env.yaml; num_obstacles overridden here)
@@ -32,7 +39,7 @@ env:
   num_envs: 350
   max_episode_length: 2200
   env_spacing: 8.0
-  num_obstacles: 300     # overrides env.yaml's env.num_obstacles (both currently 300)
+  num_obstacles: 350     # overrides env.yaml's env.num_obstacles (both currently 300)
   use_dijkstra_reward: false
   dijkstra_map_extent: 24.0       # covers randomized start/goal sides; terrain obstacles remain within map_range
   dijkstra_grid_resolution: 0.4   # metres/cell for the training-time potential map
@@ -40,10 +47,10 @@ env:
   dijkstra_inflate_radius: 0.3    # metres of obstacle inflation for the potential map
   dijkstra_reward_scale: 1.0
   dijkstra_reward_clip: 2.0
-  use_cbf_safety_reward: false
+  use_cbf_safety_reward: true
   cbf_obstacle_inflate_radius: 0.0 # keep raw obstacle geometry; cbf_safe_margin defines safety buffer
   cbf_safe_margin: 0.3            # h = distance_to_obstacle - margin
-  cbf_gamma: 2.0                  # forward-invariance condition: h_dot + gamma * h >= 0
+  cbf_gamma: 1.0                  # forward-invariance condition: h_dot + gamma * h >= 0
   cbf_reward_scale: 1.0
   cbf_reward_clip: 5.0
 
@@ -58,8 +65,8 @@ viewer:
   resolution: [960, 720]
 
 wandb:
-  project: NavRL-depth
-  name: depth_cnn_pretrain(ae+raycast)_attitude_depth_seed0_nb
+  project: NavRL-depth-deploy
+  name: depth_cnn_cbf_resume_obs350
   entity: null            # null = use the logged-in user's default entity
   mode: online            # set to 'offline' to disable cloud sync
   run_id:
@@ -81,7 +88,7 @@ sensor:
   focal_length: 10.0      # ~90 deg horizontal FOV: hfov = 2*atan(aperture/(2*focal_length))
   horizontal_aperture: 20.955
   # LiDAR for safety reward (mirrors train.yaml / env_lidar.py defaults)
-  lidar_range: 4.0
+  lidar_range: 5.0
   lidar_vfov: [-10., 20.]   # degrees
   lidar_vbeams: 4
   lidar_hres: 10.            # degrees → 36 horizontal beams
@@ -122,7 +129,7 @@ algo:
     obs_image_key: depth
     encoder_type: cnn
     # encoder_ckpt: null
-    encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-cnn-ae-raycast/latest.pt
+    encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-cnn-reach-ae/latest.pt
     # encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-vit_20260705_022556/latest.pt
     encoder_ckpt_submodule: ""
     freeze_encoder: true

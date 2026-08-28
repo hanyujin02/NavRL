@@ -65,13 +65,22 @@ def main(cfg):
     # Transformed Environment
     transforms = []
     # transforms.append(ravel_composite(env.observation_spec, ("agents", "intrinsics"), start_dim=-1))
-    controller = LeePositionController(9.81, env.drone.params).to(cfg.device)
+    # vel_gain_factor simulates a mismatched/imperfectly-tuned velocity controller
+    # for sim-to-real robustness training (see cfg/disturbance.yaml). Not every
+    # config that reaches this shared entrypoint defines `disturbance` (e.g.
+    # train.yaml/env_lidar), so default to 0.0 (no-op) via getattr rather than
+    # assuming the key exists.
+    vel_gain_factor = getattr(getattr(cfg, "disturbance", None), "vel_gain_factor", 0.0)
+    controller = LeePositionController(9.81, env.drone.params, vel_gain_factor).to(cfg.device)
     vel_transform = VelController(controller, yaw_control=False)
     transforms.append(vel_transform)
     transformed_env = TransformedEnv(env, Compose(*transforms)).train()
     transformed_env.set_seed(cfg.seed)    
     # PPO Policy
-    policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
+    policy = PPO(
+        cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device,
+        disturbance_cfg=getattr(cfg, "disturbance", None), sim_dt=cfg.sim.dt,
+    )
 
     if getattr(cfg, "checkpoint", None):
         policy.load_state_dict(torch.load(cfg.checkpoint, map_location=cfg.device))

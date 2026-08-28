@@ -1,0 +1,80 @@
+defaults:
+  - train_depth
+  - _self_
+
+# "Robust" / sim-to-real training profile — same depth-encoder setup as
+# train_depth.yaml (Option D: frozen ReachMap CNN encoder), but with the two
+# opt-in additions turned on:
+#   - disturbance.enabled: true    — sensor noise/dropout/latency, action
+#     latency/noise, velocity-gain mismatch (see cfg/disturbance.yaml for the
+#     full field list; magnitudes below match NavRL++'s own defaults).
+#   - algo.network_type: transformer — tokenized static/dynamic-obstacle/state
+#     fusion instead of the plain CNN+MLP concat (see ppo.yaml's `transformer:`
+#     block and utils.py's BuildTokens/TransformerBackbone).
+# Dynamic obstacles are also restored here (env_dyn.num_obstacles > 0,
+# feature_extractor.dyn_obs_num > 0) — this pipeline's dyn-obstacle plumbing
+# was always structurally present, just short-circuited by num_obstacles: 0
+# in train_depth.yaml; the transformer's dynamic-obstacle token and the
+# disturbance system's dyn_obs_* fields are both no-ops without this.
+#
+# train_depth.yaml itself is untouched by any of this — it stays the plain
+# encoder-comparison config this branch was built for.
+
+eval_video: true
+
+wandb:
+  project: NavRL-depth-deploy
+  name: depth_cnn_robust_transformer
+
+env_dyn:
+  num_obstacles: 0
+  vel_range: [0.5, 1.5]
+  local_range: [5.0, 5.0, 4.5]
+
+# algo:
+#   network_type: transformer
+#   feature_extractor:
+#     dyn_obs_num: 5
+
+disturbance:
+  enabled: true
+  # Depth-sensor Gaussian noise on normalized [0,1] depth — a moderate
+  # starting point (roughly eval_noise.yaml's gaussian_low/mid range);
+  # NavRL++'s own range_gaussian_std (0.3 m on a 4 m lidar range) doesn't
+  # translate directly to this codebase's normalized-depth noise vocabulary.
+  depth_noise: {type: gaussian, sigma: 0.02}
+  dyn_obs_pos_std: 0.1
+  dyn_obs_vel_std: 0.1
+  dyn_obs_miss_prob: 0.3
+  depth_input_latency: [0.0, 0.1]
+  dyn_obs_input_latency: [0.0, 0.1]
+  state_input_latency: [0.0, 0.1]
+  action_latency: [0.0, 0.04]
+  action_gaussian_std: 0.0        # matches NavRL++'s own default (off even with enabled: true)
+  action_noise_threshold: 0.0
+  vel_gain_factor: [-0.4, 0.4]
+
+
+# ── Option D: ReachMap depth ViT, no temporal, trained from scratch ──────────
+algo:
+  # 100 frames/iter x 224 envs = 22400 frames per PPO batch — identical to the
+  # previous 350 x 64, so gradient batch statistics are unchanged.
+  # training_frame_num: 100
+  network_type: transformer
+  feature_extractor:
+    use_dyn_obs_net: false
+    obs_image_key: depth
+    encoder_type: cnn
+    # encoder_ckpt: null
+    encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-cnn-reach-ae/latest.pt
+    # encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-vit_20260705_022556/latest.pt
+    encoder_ckpt_submodule: ""
+    freeze_encoder: true
+    embed_dim: 256
+    projection_mlp: true
+    img_h: 60
+    img_w: 80
+    patch_size: 10
+    vit_depth: 4
+    num_heads: 8
+    drop: 0.1

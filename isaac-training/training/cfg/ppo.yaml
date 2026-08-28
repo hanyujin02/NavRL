@@ -1,6 +1,19 @@
 algo:
+  # Feature-extractor architecture (PPO.__init__ in ppo.py):
+  #   'cnn'         (default) — depth_encoder + optional dyn-obstacle MLP,
+  #                  concatenated with state, then an MLP. Unchanged behavior.
+  #   'transformer' — depth_encoder's output tokenized alongside dynamic
+  #                  obstacle / state streams and fused via a small
+  #                  Transformer (ported from NavRL++, see algo.transformer
+  #                  below and utils.py's BuildTokens/TransformerBackbone).
+  #                  Intended to be paired with dynamic obstacles enabled
+  #                  (env_dyn.num_obstacles / feature_extractor.dyn_obs_num /
+  #                  feature_extractor.use_dyn_obs_net) for the "robust"
+  #                  profile — see train_depth_robust.yaml.
+  network_type: cnn
+
   feature_extractor:
-    learning_rate: 1e-4
+    learning_rate: 1e-5
     dyn_obs_num: 0
 
     # Observation key for the image input: 'lidar' (default), 'depth', or 'bev'
@@ -97,6 +110,16 @@ algo:
     bev_map_range: 5.0       # metres from drone centre to each grid edge
     bev_height_clip: 2.0     # matches training data collection (habitat.yaml bev_height_clip)
     bev_patch_size: 10       # ViT patch size for BEV grid (bev_grid_size % bev_patch_size == 0)
+
+  # Only used when algo.network_type: transformer. Defaults match NavRL++.
+  transformer:
+    d_model: 64
+    nhead: 4
+    num_layers: 4
+    dim_feedforward: 128
+    dropout: 0.1
+    max_T: 8                        # upper bound for the positional-encoding table (this pipeline's obs are single-frame, T=1)
+    feature_extractor_mlp: [256, 256]
 
   actor:
     learning_rate: 5e-5

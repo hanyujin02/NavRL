@@ -76,11 +76,19 @@ class LeePositionController(nn.Module):
         * controller_state: empty dict.
     """
     def __init__(
-        self, 
-        g: float, 
+        self,
+        g: float,
         uav_params,
+        vel_gain_factor: float = 0.0,
     ) -> None:
         super().__init__()
+        # Simulated velocity-gain mismatch for sim-to-real robustness training
+        # (ported from NavRL++). 0.0 (default) reproduces the exact nominal
+        # controller behavior below. A scalar biases vel_gain by a fixed
+        # multiplicative factor; a [low, high] list/tuple samples a fresh
+        # per-call, per-axis, per-env random factor in that range every step
+        # (see _compute).
+        self.vel_gain_factor = vel_gain_factor
         controller_param_path = osp.join(
             osp.dirname(__file__), "cfg", f"lee_controller_{uav_params['name']}.yaml"
         )
@@ -173,12 +181,30 @@ class LeePositionController(nn.Module):
         pos_error = pos - target_pos
         vel_error = vel - target_vel
 
-        acc = (
-            pos_error * self.pos_gain 
-            + vel_error * self.vel_gain 
-            - self.g
-            - target_acc
-        )
+        if self.vel_gain_factor != 0.0:
+            if isinstance(self.vel_gain_factor, float):
+                vel_gain = self.vel_gain * (1. + self.vel_gain_factor)
+            else:
+                factor_low = self.vel_gain_factor[0]
+                factor_high = self.vel_gain_factor[1]
+                random_factor = (factor_high - factor_low) * torch.rand(
+                    size=vel_error.shape, dtype=torch.float, device=vel_error.device
+                ) + factor_low
+                vel_gain = self.vel_gain * (1. + random_factor)
+
+            acc = (
+                pos_error * self.pos_gain
+                + vel_error * vel_gain
+                - self.g
+                - target_acc
+            )
+        else:
+            acc = (
+                pos_error * self.pos_gain
+                + vel_error * self.vel_gain
+                - self.g
+                - target_acc
+            )
         R = quaternion_to_rotation_matrix(rot)
         b1_des = torch.cat([
             torch.cos(target_yaw), 

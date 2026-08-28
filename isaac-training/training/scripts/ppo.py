@@ -1,4 +1,5 @@
 import sys
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +9,10 @@ from tensordict.nn import TensorDictModuleBase, TensorDictSequential, TensorDict
 from einops.layers.torch import Rearrange
 from torchrl.modules import ProbabilisticActor
 from torchrl.envs.transforms import CatTensors
-from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor, vec_to_world
+from utils import (
+    ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor,
+    vec_to_world, BuildTokens, TransformerBackbone,
+)
 
 # ---------------------------------------------------------------------------
 # ReachMap encoder integration
@@ -321,12 +325,25 @@ def build_depth_encoder(cfg) -> nn.Module:
 
 
 class PPO(TensorDictModuleBase):
-    def __init__(self, cfg, observation_spec, action_spec, device):
+    def __init__(self, cfg, observation_spec, action_spec, device, disturbance_cfg=None, sim_dt=0.016):
         super().__init__()
         self.cfg = cfg
         self.device = device
 
-        
+        # Sim-to-real domain-randomization config (cfg/disturbance.yaml) — a
+        # sibling of `cfg.algo` in the full config tree, so it's passed in
+        # separately rather than via self.cfg (which stays cfg.algo, matching
+        # every existing self.cfg.* access below). None (the default, used by
+        # any caller that doesn't pass it — e.g. ROS deployment) means fully
+        # disabled, identical to disturbance.enabled: false.
+        self.disturbance_cfg = disturbance_cfg
+        self.sim_dt = sim_dt
+        # Action-latency ring buffer — allocated lazily on first __call__ once
+        # the actual rollout batch size (num_envs) is known.
+        self._action_history = None
+        self._action_write_ptr = 0
+
+
         # Depth encoder: scratch CNN or pretrained ReachMap encoder
         depth_encoder = build_depth_encoder(cfg.feature_extractor).to(self.device)
 
@@ -338,25 +355,65 @@ class PPO(TensorDictModuleBase):
             img_key = "bev"
         else:
             img_key = getattr(cfg.feature_extractor, "obs_image_key", "lidar")
-        use_dyn_obs_net = getattr(cfg.feature_extractor, "use_dyn_obs_net", True)
 
-        if use_dyn_obs_net:
-            dynamic_obstacle_network = nn.Sequential(
-                Rearrange("n c w h -> n (c w h)"),
-                make_mlp([128, 64])
+        # network_type selects the WHOLE feature-extractor architecture that
+        # turns depth_encoder's output + the other observation streams into
+        # "_feature". "cnn" (default) is the original CNN+MLP-concat path,
+        # unchanged below. "transformer" (ported from NavRL++) tokenizes
+        # static(vision)/dynamic-obstacle/state streams through a small
+        # Transformer instead — see utils.py's BuildTokens/TransformerBackbone
+        # docstrings for the single-frame adaptation. Either way this block's
+        # only job is to assign self.feature_extractor; actor/critic below are
+        # architecture-agnostic (they only read "_feature").
+        network_type = getattr(cfg, "network_type", "cnn")
+
+        if network_type == "cnn":
+            use_dyn_obs_net = getattr(cfg.feature_extractor, "use_dyn_obs_net", True)
+
+            if use_dyn_obs_net:
+                dynamic_obstacle_network = nn.Sequential(
+                    Rearrange("n c w h -> n (c w h)"),
+                    make_mlp([128, 64])
+                ).to(self.device)
+                self.feature_extractor = TensorDictSequential(
+                    TensorDictModule(depth_encoder, [("agents", "observation", img_key)], ["_cnn_feature"]),
+                    TensorDictModule(dynamic_obstacle_network, [("agents", "observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
+                    CatTensors(["_cnn_feature", ("agents", "observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False),
+                    TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
+                ).to(self.device)
+            else:
+                self.feature_extractor = TensorDictSequential(
+                    TensorDictModule(depth_encoder, [("agents", "observation", img_key)], ["_cnn_feature"]),
+                    CatTensors(["_cnn_feature", ("agents", "observation", "state")], "_feature", del_keys=False),
+                    TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
+                ).to(self.device)
+        elif network_type == "transformer":
+            tcfg = cfg.transformer
+            # Drop the dynamic-obstacle token entirely when there are none to
+            # sense (dyn_obs_num=0, e.g. train_depth_robust.yaml with
+            # env_dyn.num_obstacles=0) — otherwise it's a dead, all-zero
+            # token with its own unused adapter weights. Automatically comes
+            # back once dyn_obs_num > 0 (dynamic obstacles turned on).
+            dyn_obs_num = getattr(cfg.feature_extractor, "dyn_obs_num", 0)
+            use_dynamic_token = dyn_obs_num > 0
+            build_tokens = BuildTokens(
+                d_model=tcfg.d_model, max_T=getattr(tcfg, "max_T", 8), use_dynamic=use_dynamic_token,
             ).to(self.device)
+            transformer_backbone = TransformerBackbone(
+                d_model=tcfg.d_model, nhead=tcfg.nhead, num_layers=tcfg.num_layers,
+                dim_feedforward=tcfg.dim_feedforward, dropout=tcfg.dropout,
+            ).to(self.device)
+            token_in_keys = ["_cnn_feature", ("agents", "observation", "state")]
+            if use_dynamic_token:
+                token_in_keys.append(("agents", "observation", "dynamic_obstacle"))
             self.feature_extractor = TensorDictSequential(
                 TensorDictModule(depth_encoder, [("agents", "observation", img_key)], ["_cnn_feature"]),
-                TensorDictModule(dynamic_obstacle_network, [("agents", "observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"]),
-                CatTensors(["_cnn_feature", ("agents", "observation", "state"), "_dynamic_obstacle_feature"], "_feature", del_keys=False),
-                TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
+                TensorDictModule(build_tokens, token_in_keys, ["_token"]),
+                TensorDictModule(transformer_backbone, ["_token"], ["_feature"]),
+                TensorDictModule(make_mlp(list(tcfg.feature_extractor_mlp)), ["_feature"], ["_feature"]),
             ).to(self.device)
         else:
-            self.feature_extractor = TensorDictSequential(
-                TensorDictModule(depth_encoder, [("agents", "observation", img_key)], ["_cnn_feature"]),
-                CatTensors(["_cnn_feature", ("agents", "observation", "state")], "_feature", del_keys=False),
-                TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
-            ).to(self.device)
+            raise ValueError(f"Unknown algo.network_type '{network_type}'. Choose 'cnn' or 'transformer'.")
 
         # Actor etwork
         self.n_agents, self.action_dim = action_spec.shape
@@ -419,8 +476,68 @@ class PPO(TensorDictModuleBase):
         # Cooridnate change: transform local to world
         actions = (2 * tensordict["agents", "action_normalized"] * self.cfg.actor.action_limit) - self.cfg.actor.action_limit
         actions_world = vec_to_world(actions, tensordict["agents", "observation", "direction"])
+
+        actions_world = self._apply_action_disturbance(actions_world)
+
         tensordict["agents", "action"] = actions_world
         return tensordict
+
+    def _apply_action_disturbance(self, actions_world: torch.Tensor) -> torch.Tensor:
+        """Action-latency + Gaussian action noise, ported from NavRL++ (ppo.py
+        __call__). No-op unless disturbance_cfg.enabled and the relevant
+        field is non-zero — see disturbance.yaml for the exact gating.
+
+        Simplification vs. NavRL++: skips the per-env "not enough history
+        yet" fallback (there, borrowed from an env-side history-length
+        counter this pipeline doesn't track) — the ring buffer is
+        zero-initialized and read unconditionally once latency is enabled,
+        which only affects the first ~0.3s of a run/episode.
+        """
+        dcfg = self.disturbance_cfg
+        if dcfg is None or not getattr(dcfg, "enabled", False):
+            return actions_world
+
+        action_latency = getattr(dcfg, "action_latency", 0.0)
+        has_latency = (action_latency != 0.0) if isinstance(action_latency, float) else any(action_latency)
+        if has_latency:
+            B = actions_world.shape[0]
+            action_dim = actions_world.shape[-1]
+            hist_length = int(0.3 / self.sim_dt) + 1
+            if self._action_history is None or self._action_history.shape[0] != B:
+                self._action_history = torch.zeros(
+                    B, hist_length, action_dim, device=actions_world.device
+                )
+                self._action_write_ptr = 0
+
+            j = self._action_write_ptr % hist_length
+            self._action_history[:, j, :] = actions_world.detach().reshape(B, action_dim)
+            self._action_write_ptr += 1
+            base = torch.arange(hist_length, device=actions_world.device)
+            idx = (base + (self._action_write_ptr % hist_length)) % hist_length  # oldest to newest
+
+            if isinstance(action_latency, float):
+                action_latency_step = int(action_latency / self.sim_dt) + 1
+            else:
+                low = int(action_latency[0] / self.sim_dt) + 1
+                high = int(action_latency[1] / self.sim_dt) + 1
+                action_latency_step = np.random.randint(low=low, high=high + 1)
+            action_latency_step = min(action_latency_step, hist_length)
+
+            delayed_idx = idx[-action_latency_step]
+            actions_world = self._action_history[:, delayed_idx, :].reshape(actions_world.shape)
+
+        action_gaussian_std = getattr(dcfg, "action_gaussian_std", 0.0)
+        if action_gaussian_std != 0.0:
+            action_noise_threshold = getattr(dcfg, "action_noise_threshold", 0.0)
+            actions_world_norm = torch.norm(actions_world, dim=-1, keepdim=True)
+            mask = actions_world_norm > action_noise_threshold
+            noise = torch.normal(
+                mean=torch.zeros_like(actions_world),
+                std=action_gaussian_std * torch.ones_like(actions_world),
+            )
+            actions_world = actions_world + mask * noise
+
+        return actions_world
 
     def _lr_decay_factor(self) -> float:
         if not self.lr_decay:
