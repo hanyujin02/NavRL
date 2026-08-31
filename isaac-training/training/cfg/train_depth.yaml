@@ -15,8 +15,7 @@ env_script: env_depth   # selects training/scripts/env_depth.py
 # restored (optimizer/iteration count restart at 0, see train.py), and
 # max_frame_num below is raised to 12e8 so this actually gets a full
 # additional training budget instead of just finishing the last ~3%.
-checkpoint: /home/hanyujin/ReachMap/NavRL/isaac-training/wandb/run-20260828_115509-vww9fjmw/files/best.pt        # path to .pt file to resume from; null = train from scratch
-
+checkpoint: /home/hanyujin/ReachMap/NavRL/isaac-training/wandb/run-20260830_042506-5amir9nx/files/checkpoint_89000.pt        # path to .pt file to resume from; null = train from scratch
 headless: True
 device: "cuda:0"
 seed: 1
@@ -28,7 +27,7 @@ save_interval: 1000
 
 # Skip eval video recording (RTX viewer pipeline + ~2.5 GB frame buffer).
 # Depth sensors and all eval metrics are unaffected; only the wandb mp4 is dropped.
-eval_video: true
+eval_video: false
 
 # Training Environment
 # (obstacle layout / map_range live in cfg/env.yaml; num_obstacles overridden here)
@@ -36,10 +35,10 @@ env:
   # 224 envs (was 350) to fit a ~16 GB GPU budget — camera/physics memory scales
   # linearly with num_envs. PPO batch size is preserved exactly via
   # algo.training_frame_num: 100 below (224 x 100 = 22400 = 350 x 64).
-  num_envs: 350
+  num_envs: 200
   max_episode_length: 2200
   env_spacing: 8.0
-  num_obstacles: 350     # overrides env.yaml's env.num_obstacles (both currently 300)
+  num_obstacles: 300     # overrides env.yaml's env.num_obstacles (both currently 300)
   use_dijkstra_reward: false
   dijkstra_map_extent: 24.0       # covers randomized start/goal sides; terrain obstacles remain within map_range
   dijkstra_grid_resolution: 0.4   # metres/cell for the training-time potential map
@@ -47,7 +46,7 @@ env:
   dijkstra_inflate_radius: 0.3    # metres of obstacle inflation for the potential map
   dijkstra_reward_scale: 1.0
   dijkstra_reward_clip: 2.0
-  use_cbf_safety_reward: true
+  use_cbf_safety_reward: false
   cbf_obstacle_inflate_radius: 0.0 # keep raw obstacle geometry; cbf_safe_margin defines safety buffer
   cbf_safe_margin: 0.3            # h = distance_to_obstacle - margin
   cbf_gamma: 1.0                  # forward-invariance condition: h_dot + gamma * h >= 0
@@ -66,7 +65,7 @@ viewer:
 
 wandb:
   project: NavRL-depth-deploy
-  name: depth_cnn_cbf_resume_obs350
+  name: depth_reach_ae_gru_test
   entity: null            # null = use the logged-in user's default entity
   mode: online            # set to 'offline' to disable cloud sync
   run_id:
@@ -124,13 +123,13 @@ algo:
   # 100 frames/iter x 224 envs = 22400 frames per PPO batch — identical to the
   # previous 350 x 64, so gradient batch statistics are unchanged.
   # training_frame_num: 100
+  network_type: gru
   feature_extractor:
     use_dyn_obs_net: false
     obs_image_key: depth
     encoder_type: cnn
     # encoder_ckpt: null
     encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-cnn-reach-ae/latest.pt
-    # encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/depth-vit_20260705_022556/latest.pt
     encoder_ckpt_submodule: ""
     freeze_encoder: true
     embed_dim: 256

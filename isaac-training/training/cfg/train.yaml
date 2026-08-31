@@ -41,7 +41,26 @@ algo:
     obs_image_key: lidar   # required override — ppo.yaml's default is now "depth"
                             # (set for the depth-camera branch); env_lidar.py's
                             # observation dict only has a "lidar" key.
+    learning_rate: 2e-4     # matches NavRL-plus-plus's ppo.yaml (was 5e-4 default)
+    encoder_type: lidar_navrlpp   # NavRL++'s exact static-obstacle CNN (was 'scratch' default)
   network_type: transformer
+
+  # PPO hyperparameters aligned to NavRL-plus-plus's ppo.yaml exactly, so this
+  # comparison isolates the code/environment differences (state-window port,
+  # LayerNorm/ValueNorm fixes) rather than hyperparameter differences. Only
+  # overridden here (not in the shared ppo.yaml) so train_depth*.yaml's
+  # already-tuned settings are untouched.
+  actor:
+    learning_rate: 2e-4    # was 5e-5
+    clip_ratio: 0.1        # was 0.2
+    action_limit: 3.0      # was 2.0
+  critic:
+    learning_rate: 2e-4    # was 1e-4
+    clip_ratio: 0.1        # was 0.2
+  entropy_loss_coefficient: 1e-3   # was 1e-2
+  training_frame_num: 256          # was 64
+  training_epoch_num: 4            # was 2
+  num_minibatches: 32              # was 8
 
 viewer:
   eye: [0., 40., 40.]

@@ -11,8 +11,8 @@ from ppo import PPO
 from omni_drones.controllers import LeePositionController
 from omni_drones.utils.torchrl.transforms import VelController, ravel_composite
 from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
-from torchrl.envs.transforms import TransformedEnv, Compose
-from utils import evaluate
+from torchrl.envs.transforms import TransformedEnv, Compose, InitTracker
+from utils import evaluate, make_batched_gru_primer
 from torchrl.envs.utils import ExplorationType
 
 
@@ -85,7 +85,19 @@ def main(cfg):
     if getattr(cfg, "checkpoint", None):
         policy.load_state_dict(torch.load(cfg.checkpoint, map_location=cfg.device))
         print(f"[NavRL]: resumed from checkpoint: {cfg.checkpoint}")
-    
+
+    # network_type: gru needs the env to carry an "is_init" reset flag and a
+    # "recurrent_state" hidden-state key across steps -- InitTracker sets the
+    # former, the primer wires the latter (including zeroing it for envs whose
+    # episode just ended). make_batched_gru_primer instead of the module's own
+    # make_tensordict_primer(): IsaacEnv is batch-locked, so the spec needs the
+    # num_envs leading dim (see that helper's docstring). No-op for cnn/transformer.
+    if getattr(cfg.algo, "network_type", "cnn") == "gru":
+        transformed_env.append_transform(InitTracker())
+        transformed_env.append_transform(
+            make_batched_gru_primer(policy.gru_module, cfg.env.num_envs, cfg.device)
+        )
+
     # Episode Stats Collector
     episode_stats_keys = [
         k for k in transformed_env.observation_spec.keys(True, True) 

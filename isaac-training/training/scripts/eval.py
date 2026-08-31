@@ -45,9 +45,9 @@ from omni.isaac.kit import SimulationApp
 from ppo import PPO
 from omni_drones.controllers import LeePositionController
 from omni_drones.utils.torchrl.transforms import VelController
-from torchrl.envs.transforms import TransformedEnv, Compose
+from torchrl.envs.transforms import TransformedEnv, Compose, InitTracker
 from torchrl.envs.utils import ExplorationType, set_exploration_type
-from utils import evaluate
+from utils import evaluate, make_batched_gru_primer
 
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
 
@@ -98,6 +98,16 @@ def main(cfg: DictConfig):
         print(f"[eval] MISSING keys (left at random init!): {missing[:8]}"
               + (" …" if len(missing) > 8 else ""))
     print(f"[eval] Loaded checkpoint: {cfg.checkpoint}")
+
+    # network_type: gru needs the env to carry an "is_init" reset flag and a
+    # "recurrent_state" hidden-state key across steps -- must be wired before
+    # the warm-up rollout below, the first reset/step ever run on this env.
+    # No-op for cnn/transformer.
+    if getattr(cfg.algo, "network_type", "cnn") == "gru":
+        transformed_env.append_transform(InitTracker())
+        transformed_env.append_transform(
+            make_batched_gru_primer(policy.gru_module, cfg.env.num_envs, cfg.device)
+        )
 
     # PPO overrides train() for RL — a freshly constructed policy defaults to
     # nn.Module's training=True and is never toggled, so any BatchNorm in the

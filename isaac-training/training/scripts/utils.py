@@ -104,7 +104,15 @@ class ValueNorm(nn.Module):
         debiased_mean_sq = self.running_mean_sq / self.debiasing_term.clamp(
             min=self.epsilon
         )
-        debiased_var = (debiased_mean_sq - debiased_mean**2).clamp(min=1e-2)
+        # Upper bound matters as much as the lower one: a single outlier return
+        # (e.g. one physics-glitch transition) squared into running_mean_sq can
+        # push this arbitrarily high, and the EMA (beta=0.995, ~138-step half-life)
+        # keeps it there for a long time. denormalize() then multiplies by
+        # sqrt(var) -- "huge but finite" isn't caught by any isnan/isfinite
+        # check downstream, and squaring it again during advantage.std() is what
+        # actually overflows into NaN. 1e6 is far above any plausible return
+        # variance here, so this never engages during normal training.
+        debiased_var = (debiased_mean_sq - debiased_mean**2).clamp(min=1e-2, max=1e6)
         return debiased_mean, debiased_var
 
     @torch.no_grad()
@@ -132,6 +140,16 @@ class ValueNorm(nn.Module):
         out = input_vector * torch.sqrt(var) + mean
         return out
 
+def build_conv_stack(channels, kernel_size, stride, padding, activation=nn.ELU, groups=1):
+    """Build a stack of LazyConv2d + activation using per-layer params.
+    Ported verbatim from NavRL-plus-plus's utils.py -- used by ppo.py's
+    encoder_type: lidar_navrlpp to reproduce NavRL++'s exact static-obstacle
+    CNN for a like-for-like architecture comparison."""
+    layers = []
+    for out_c, k, s, p in zip(channels, kernel_size, stride, padding):
+        layers += [nn.LazyConv2d(out_channels=out_c, kernel_size=k, stride=s, padding=p, groups=groups), activation()]
+    return nn.Sequential(*layers)
+
 def make_mlp(num_units):
     layers = []
     for n in num_units:
@@ -139,6 +157,34 @@ def make_mlp(num_units):
         layers.append(nn.LeakyReLU())
         layers.append(nn.LayerNorm(n))
     return nn.Sequential(*layers)
+
+
+def make_batched_gru_primer(gru_module, num_envs, device):
+    """TensorDictPrimer for a GRUModule's hidden state, shaped for a batched env.
+
+    GRUModule.make_tensordict_primer() declares the hidden-state spec as
+    (num_layers, hidden_size) with no leading batch dim. TensorDictPrimer's own
+    transform_observation_spec then rejects it against a batch-locked env whose
+    observation_spec.shape is (num_envs,):
+        "The leading shape of the primer specs should match the one of the
+         parent env. Got observation_spec.shape=torch.Size([N]) but the
+         'recurrent_state' entry's shape is torch.Size([num_layers, hidden])."
+    IsaacEnv is exactly such an env, so build the spec with the batch dim
+    prepended instead. Key name is read off the module (in_keys[1]) rather than
+    hardcoded, so a renamed in_key/out_key keeps working.
+    """
+    from torchrl.envs.transforms import TensorDictPrimer
+    from torchrl.data import UnboundedContinuousTensorSpec
+
+    hidden_key = gru_module.in_keys[1]
+    return TensorDictPrimer(
+        {
+            hidden_key: UnboundedContinuousTensorSpec(
+                shape=(num_envs, gru_module.gru.num_layers, gru_module.gru.hidden_size),
+                device=device,
+            )
+        }
+    )
 
 
 # ── Transformer feature-extractor option (algo.network_type: transformer) ───
@@ -216,16 +262,24 @@ class BuildTokens(nn.Module):
         B = static.shape[0]
         cls_token = self.cls_token.expand(B, 1, -1) + self.type_embedding.weight[0].view(1, 1, -1)
         static_token = static_token + self.type_embedding.weight[1].view(1, 1, -1)
-        state_token = state_token + self.type_embedding.weight[2].view(1, 1, -1)
 
         if self.use_dynamic:
+            # Line-by-line aligned to NavRL-plus-plus's BuildTokens.forward
+            # (utils.py:63-93 there) for this branch specifically: type-embedding
+            # index assignment (2=dynamic, 3=state, not 2=state/3=dynamic) and
+            # token concat order (dynamic before state) both match NavRL++
+            # exactly here. The use_dynamic=False branch below (depth's
+            # 3-token path) is intentionally NOT changed -- it predates and is
+            # independent of NavRL++'s always-4-token design.
+            state_token = state_token + self.type_embedding.weight[3].view(1, 1, -1)
             dynamic = dynamic.reshape(dynamic.shape[0], dynamic.shape[1], -1)
             T = dynamic.shape[1]
             dynamic_token = self.dyn_adapter(dynamic)
             dynamic_token = dynamic_token + self.time_pe(T)[None, :, :]
-            dynamic_token = dynamic_token + self.type_embedding.weight[3].view(1, 1, -1)
-            tokens = torch.cat([cls_token, static_token, state_token, dynamic_token], dim=-2)
+            dynamic_token = dynamic_token + self.type_embedding.weight[2].view(1, 1, -1)
+            tokens = torch.cat([cls_token, static_token, dynamic_token, state_token], dim=-2)
         else:
+            state_token = state_token + self.type_embedding.weight[2].view(1, 1, -1)
             tokens = torch.cat([cls_token, static_token, state_token], dim=-2)
         return tokens
 
@@ -250,7 +304,13 @@ class TransformerBackbone(nn.Module):
             norm_first=norm_first,
             activation="gelu",
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        # Pre-LN (norm_first=True) leaves the residual stream itself
+        # unnormalized between layers -- PyTorch's own docs note the encoder
+        # output then needs a final LayerNorm, or its magnitude grows
+        # unbounded with depth. Without this, the CLS feature feeding the
+        # actor head can explode and produce NaN log_probs.
+        encoder_norm = nn.LayerNorm(d_model) if norm_first else None
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers, norm=encoder_norm)
 
     def forward(self, x):
         return self.encoder(x)[:, 0, :]
@@ -278,7 +338,11 @@ class Actor(nn.Module):
     
     def forward(self, features: torch.Tensor):
         loc = self.actor_mean(features)
-        scale = torch.exp(self.actor_std).expand_as(loc)
+        # Clamp before exp() so a runaway actor_std (e.g. from an unstable
+        # backbone early in training) can't overflow to inf and NaN out the
+        # downstream Normal log_prob -- IndependentNormal already floors the
+        # scale at 1e-6, this just adds the missing upper bound.
+        scale = torch.exp(self.actor_std.clamp(-5.0, 2.0)).expand_as(loc)
         return loc, scale
 
 class BetaActor(nn.Module):
@@ -326,13 +390,27 @@ class GAE(nn.Module):
         return advantages, returns
 
 def make_batch(tensordict: TensorDict, num_minibatches: int):
-    tensordict = tensordict.reshape(-1) 
+    tensordict = tensordict.reshape(-1)
     perm = torch.randperm(
         (tensordict.shape[0] // num_minibatches) * num_minibatches,
         device=tensordict.device,
     ).reshape(num_minibatches, -1)
     for indices in perm:
         yield tensordict[indices]
+
+def make_batch_recurrent(tensordict: TensorDict, num_minibatches: int):
+    # tensordict: (num_env, num_frames, ...). Unlike make_batch, do NOT
+    # reshape(-1) -- a recurrent feature_extractor (network_type: gru, run in
+    # set_recurrent_mode(True)) needs each selected env's full, time-ordered
+    # (num_frames, ...) sequence intact for BPTT; shuffling across the frame
+    # axis would break the GRU's hidden-state recursion.
+    num_envs = tensordict.shape[0]
+    perm = torch.randperm(
+        (num_envs // num_minibatches) * num_minibatches,
+        device=tensordict.device,
+    ).reshape(num_minibatches, -1)
+    for indices in perm:
+        yield tensordict[indices]   # (num_envs_per_mb, num_frames, ...), time order preserved
 
 @torch.no_grad()
 def evaluate(

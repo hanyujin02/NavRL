@@ -36,6 +36,26 @@ class NavigationEnv(IsaacEnv):
         self.lidar_hres = cfg.sensor.lidar_hres
         self.lidar_hbeams = int(360/self.lidar_hres)
 
+        # Windowed state/dynamic-obstacle history config, ported from NavRL++'s
+        # env.py ring buffer (lidar_history/state_history/dyn_obs_state_history)
+        # -- only for network_type: transformer, whose BuildTokens already
+        # natively accepts a (N, T, D) state/dynamic_obstacle without any
+        # code changes (only its "static"/lidar token is forced to T=1,
+        # matching NavRL++'s own active transformer branch, which collapses
+        # its own 5-frame lidar window back to the latest frame via
+        # takeLatestInput before encoding -- so lidar/vision is intentionally
+        # NOT windowed here either). cnn/gru never set this True, so they see
+        # byte-identical single-frame state/dynamic_obstacle to before this.
+        # Computed BEFORE super().__init__() because that call triggers
+        # _set_specs() (IsaacEnv.__init__ -> self._set_specs()), which reads
+        # self._input_len to declare the observation_spec shape.
+        self._use_state_window = getattr(cfg.algo, "network_type", "cnn") == "transformer"
+        if self._use_state_window:
+            scfg = cfg.algo.state
+            self._hist_len = int((scfg.history_length + 0.5) / cfg.sim.dt) + 1
+            self._hist_interval = max(1, int(scfg.dt / cfg.sim.dt))
+            self._input_len = int(int(scfg.history_length / cfg.sim.dt) / self._hist_interval) + 1
+
         super().__init__(cfg, cfg.headless)
         
         # Drone Initialization
@@ -72,7 +92,17 @@ class NavigationEnv(IsaacEnv):
             self.prev_drone_vel_w = torch.zeros(self.num_envs, 1 , 3)
             # self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
             # self.target_pos[:, 0, 1] = 24.
-            # self.target_pos[:, 0, 2] = 2.     
+            # self.target_pos[:, 0, 2] = 2.
+
+            # Windowed state/dynamic-obstacle history buffers (config/scalars
+            # already computed above, before super().__init__()). Allocated
+            # here where self.num_envs/self.device are available.
+            if self._use_state_window:
+                self._state_history = torch.zeros(self.num_envs, self._hist_len, 8)
+                self._dyn_obs_state_history = torch.zeros(
+                    self.num_envs, self._hist_len, cfg.algo.feature_extractor.dyn_obs_num, 10
+                )
+                self._hist_write_ptr = 0
 
 
     def _design_scene(self):
@@ -295,14 +325,24 @@ class NavigationEnv(IsaacEnv):
         observation_dim = 8
         num_dim_each_dyn_obs_state = 10
 
+        # state/dynamic_obstacle get a leading (input_len,) window only for
+        # network_type: transformer (see __init__'s self._use_state_window);
+        # cnn/gru keep the original single-frame shapes unchanged.
+        state_shape = (self._input_len, observation_dim) if self._use_state_window else (observation_dim,)
+        dyn_obstacle_shape = (
+            (self._input_len, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state)
+            if self._use_state_window
+            else (1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state)
+        )
+
         # Observation Spec
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
                 "observation": CompositeSpec({
-                    "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device), 
+                    "state": UnboundedContinuousTensorSpec(state_shape, device=self.device),
                     "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.lidar_vbeams), device=self.device),
                     "direction": UnboundedContinuousTensorSpec((1, 3), device=self.device),
-                    "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.device),
+                    "dynamic_obstacle": UnboundedContinuousTensorSpec(dyn_obstacle_shape, device=self.device),
                 }),
             }).expand(self.num_envs)
         }, shape=[self.num_envs], device=self.device)
@@ -416,7 +456,14 @@ class NavigationEnv(IsaacEnv):
         self.height_range[env_ids, 0, 0] = torch.min(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
         self.height_range[env_ids, 0, 1] = torch.max(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
 
-        self.stats[env_ids] = 0.  
+        # Zero the windowed-state ring buffer for these envs so a fresh
+        # episode doesn't start with the previous episode's history (mirrors
+        # NavRL++'s reset_history, env.py:773-778). No-op for cnn/gru.
+        if self._use_state_window:
+            self._state_history[env_ids] = 0.
+            self._dyn_obs_state_history[env_ids] = 0.
+
+        self.stats[env_ids] = 0.
         
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")] 
@@ -534,13 +581,37 @@ class NavigationEnv(IsaacEnv):
         else:
             dyn_obs_states = torch.zeros(self.num_envs, 1, self.cfg.algo.feature_extractor.dyn_obs_num, 10, device=self.cfg.device)
             dynamic_collision = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.cfg.device)
-            
+
+        # Windowed state/dynamic_obstacle history for network_type: transformer
+        # (see __init__'s self._use_state_window) -- ported from NavRL++'s
+        # env.py ring buffer (write every step, strided index_select read).
+        # No-op branch (else) is the original single-frame behavior, used by
+        # cnn/gru unchanged.
+        if self._use_state_window:
+            j = self._hist_write_ptr % self._hist_len
+            self._state_history[:, j] = drone_state.detach()
+            self._dyn_obs_state_history[:, j] = dyn_obs_states.detach().squeeze(1)
+            self._hist_write_ptr += 1
+
+            stop = self._hist_len - 1
+            start = stop - (self._input_len - 1) * self._hist_interval
+            take = torch.arange(start, stop + 1, self._hist_interval, device=self.device)
+            # index_select needs absolute ring-buffer slots, not raw age
+            # offsets -- shift by the write pointer the same way NavRL++
+            # does (env.py:1376-1386).
+            take = (take + self._hist_write_ptr) % self._hist_len
+            state_for_obs = self._state_history.index_select(1, take)           # (N, input_len, 8)
+            dyn_obs_for_obs = self._dyn_obs_state_history.index_select(1, take)  # (N, input_len, dyn_obs_num, 10)
+        else:
+            state_for_obs = drone_state
+            dyn_obs_for_obs = dyn_obs_states
+
         # -----------------Network Input Final--------------
         obs = {
-            "state": drone_state,
+            "state": state_for_obs,
             "lidar": self.lidar_scan,
             "direction": target_dir_2d,
-            "dynamic_obstacle": dyn_obs_states
+            "dynamic_obstacle": dyn_obs_for_obs
         }
 
 

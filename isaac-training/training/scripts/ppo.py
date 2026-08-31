@@ -7,11 +7,11 @@ from pathlib import Path
 from tensordict.tensordict import TensorDict
 from tensordict.nn import TensorDictModuleBase, TensorDictSequential, TensorDictModule
 from einops.layers.torch import Rearrange
-from torchrl.modules import ProbabilisticActor
+from torchrl.modules import ProbabilisticActor, GRUModule
 from torchrl.envs.transforms import CatTensors
 from utils import (
-    ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor,
-    vec_to_world, BuildTokens, TransformerBackbone,
+    ValueNorm, make_mlp, build_conv_stack, IndependentNormal, Actor, GAE, make_batch,
+    make_batch_recurrent, IndependentBeta, BetaActor, vec_to_world, BuildTokens, TransformerBackbone,
 )
 
 # ---------------------------------------------------------------------------
@@ -167,6 +167,40 @@ class ReachMapEncoderWrapper(nn.Module):
         return self.projection(context)      # (N, embed_dim // 2) if projection_mlp else (N, embed_dim)
 
 
+class FlattenLeadingDims(nn.Module):
+    """Let a per-timestep encoder accept more than one leading batch dim.
+
+    The ReachMap encoders (and the dynamic-obstacle Rearrange) take exactly one
+    batch dim: (B, T, H, W) for depth/lidar, (n, c, w, h) for dyn-obs. The
+    cnn/transformer paths never hand them more, because they only call the
+    feature extractor either on a single-batch-dim rollout tensordict or
+    through torch.vmap (which strips the env dim) in train()'s next-value
+    bootstrap. The gru path has no such luxury: GRUModule's recurrent mode
+    needs a real (num_env, num_frames) time axis, so the extractor is called
+    directly on a 2-batch-dim tensordict -- both for the bootstrap and for
+    make_batch_recurrent's minibatches -- which would reach the encoder as a
+    5-dim tensor.
+
+    These upstream modules are per-timestep and order-independent, so folding
+    the extra dims into the batch dim and restoring them afterwards is exact,
+    not an approximation. Only the GRU itself needs the (batch, time) split,
+    and it sits downstream of this.
+    """
+
+    def __init__(self, module: nn.Module, n_feature_dims: int = 3):
+        super().__init__()
+        self.module = module
+        self.n_feature_dims = n_feature_dims
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        n_lead = x.dim() - self.n_feature_dims
+        if n_lead <= 1:
+            return self.module(x)          # ordinary single-batch-dim call
+        lead = x.shape[:n_lead]
+        out = self.module(x.reshape(-1, *x.shape[n_lead:]))
+        return out.reshape(*lead, *out.shape[1:])
+
+
 def _load_encoder_ckpt(encoder: nn.Module, ckpt_path: str, submodule: str = "") -> None:
     """Load encoder weights from a ReachNet checkpoint (best.pt / latest.pt).
 
@@ -236,6 +270,25 @@ def build_depth_encoder(cfg) -> nn.Module:
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim // 2),
             nn.ReLU(),
+        )
+
+    # ── NavRL-plus-plus's exact static-obstacle (lidar) CNN ────────────────────
+    # Ported verbatim from NavRL-plus-plus's ppo.py "transformer" branch's
+    # static_obstacle_network, for a like-for-like architecture comparison
+    # against this repo's generic 'scratch' CNN on the lidar+transformer path.
+    # Outputs 128-d (not embed_dim) -- matches NavRL++ exactly; BuildTokens'
+    # own static_adapter (a LazyLinear) maps whatever width this returns to
+    # d_model, so it doesn't need to be embed_dim-sized.
+    if encoder_type == "lidar_navrlpp":
+        return nn.Sequential(
+            build_conv_stack(
+                channels=[4, 16, 16],
+                kernel_size=[[5, 3], [5, 3], [5, 3]],
+                stride=[[1, 1], [2, 1], [2, 1]],
+                padding=[[2, 1], [2, 1], [2, 1]],
+            ),
+            Rearrange("n c w h -> n (c w h)"),
+            make_mlp([128]),
         )
 
     # ── ReachMap encoder ─────────────────────────────────────────────────────
@@ -362,10 +415,14 @@ class PPO(TensorDictModuleBase):
         # unchanged below. "transformer" (ported from NavRL++) tokenizes
         # static(vision)/dynamic-obstacle/state streams through a small
         # Transformer instead — see utils.py's BuildTokens/TransformerBackbone
-        # docstrings for the single-frame adaptation. Either way this block's
-        # only job is to assign self.feature_extractor; actor/critic below are
-        # architecture-agnostic (they only read "_feature").
+        # docstrings for the single-frame adaptation. "gru" concatenates the
+        # same streams as "cnn" into one vector, then runs a GRU that carries
+        # real hidden state across env steps (genuine temporal memory, unlike
+        # the other two, which are both per-timestep-only). Either way this
+        # block's only job is to assign self.feature_extractor; actor/critic
+        # below are architecture-agnostic (they only read "_feature").
         network_type = getattr(cfg, "network_type", "cnn")
+        self.network_type = network_type
 
         if network_type == "cnn":
             use_dyn_obs_net = getattr(cfg.feature_extractor, "use_dyn_obs_net", True)
@@ -412,8 +469,72 @@ class PPO(TensorDictModuleBase):
                 TensorDictModule(transformer_backbone, ["_token"], ["_feature"]),
                 TensorDictModule(make_mlp(list(tcfg.feature_extractor_mlp)), ["_feature"], ["_feature"]),
             ).to(self.device)
+        elif network_type == "gru":
+            gcfg = cfg.gru
+            use_dyn_obs_net = getattr(cfg.feature_extractor, "use_dyn_obs_net", True)
+
+            # FlattenLeadingDims: this branch's extractor is called on
+            # (num_env, num_frames)-shaped tensordicts (see its docstring), so
+            # the per-timestep encoder / dyn-obs net need the extra leading dim
+            # folded away. cnn/transformer wrap nothing and are unaffected.
+            upstream_modules = [
+                TensorDictModule(
+                    FlattenLeadingDims(depth_encoder, n_feature_dims=3),
+                    [("agents", "observation", img_key)], ["_cnn_feature"],
+                ),
+            ]
+            if use_dyn_obs_net:
+                dynamic_obstacle_network = nn.Sequential(
+                    Rearrange("n c w h -> n (c w h)"),
+                    make_mlp([128, 64])
+                ).to(self.device)
+                upstream_modules.append(
+                    TensorDictModule(
+                        FlattenLeadingDims(dynamic_obstacle_network, n_feature_dims=3),
+                        [("agents", "observation", "dynamic_obstacle")], ["_dynamic_obstacle_feature"],
+                    )
+                )
+                cat_in_keys = ["_cnn_feature", ("agents", "observation", "state"), "_dynamic_obstacle_feature"]
+            else:
+                cat_in_keys = ["_cnn_feature", ("agents", "observation", "state")]
+            upstream_modules.append(CatTensors(cat_in_keys, "_feature", del_keys=False))
+            # nn.GRU has no Lazy variant, so this MUST project to a concrete,
+            # fixed width == gcfg.input_size (unlike cnn's make_mlp([256,256])
+            # above, which only needs to be LazyLinear-consistent).
+            upstream_modules.append(TensorDictModule(make_mlp([gcfg.input_size]), ["_feature"], ["_feature"]))
+
+            # python_based=True: nn.GRU's cuDNN backend is not vmap-compatible,
+            # and train() below calls torch.vmap(self.feature_extractor)(...)
+            # to bootstrap next-state values — this MUST stay True or that
+            # call breaks (see torchrl's own test_gru_vmap_complex_model).
+            self.gru_module = GRUModule(
+                input_size=gcfg.input_size,
+                hidden_size=gcfg.hidden_size,
+                num_layers=getattr(gcfg, "num_layers", 1),
+                dropout=getattr(gcfg, "dropout", 0.0),
+                python_based=True,
+                device=self.device,
+                in_key="_feature",
+                out_key="_feature",
+            )
+            # Rollout/inference: step-by-step, one env-step per call.
+            self.feature_extractor = TensorDictSequential(*upstream_modules, self.gru_module).to(self.device)
+            # Training/BPTT: same upstream module OBJECTS (weight-shared with
+            # the rollout extractor above) + the GRU in recurrent mode, used
+            # only by _update() over make_batch_recurrent's time-ordered
+            # minibatches (see train()/_update() below).
+            self.feature_extractor_train = TensorDictSequential(
+                *upstream_modules, self.gru_module.set_recurrent_mode(True)
+            ).to(self.device)
         else:
-            raise ValueError(f"Unknown algo.network_type '{network_type}'. Choose 'cnn' or 'transformer'.")
+            raise ValueError(f"Unknown algo.network_type '{network_type}'. Choose 'cnn', 'transformer', or 'gru'.")
+
+        # _update() reads through this — equals self.feature_extractor for
+        # cnn/transformer (same object, so the call in _update() is a no-op
+        # change for those two), and the recurrent-mode extractor for gru.
+        self._train_feature_extractor = (
+            self.feature_extractor_train if network_type == "gru" else self.feature_extractor
+        )
 
         # Actor etwork
         self.n_agents, self.action_dim = action_spec.shape
@@ -457,6 +578,16 @@ class PPO(TensorDictModuleBase):
         dummy_input = observation_spec.zero()
         # print("dummy_input: ", dummy_input)
 
+        # GRUModule.forward() unconditionally reads "is_init" (no default,
+        # raises if missing); observation_spec.zero() won't have it until
+        # InitTracker is wired into the env (train.py/eval.py, only when
+        # network_type=="gru"). Gated strictly behind "gru" so cnn/transformer's
+        # warmup call is byte-for-byte unchanged -- no new key injected at all.
+        if network_type == "gru" and "is_init" not in dummy_input.keys():
+            dummy_input.set(
+                "is_init",
+                torch.zeros(*dummy_input.batch_size, 1, dtype=torch.bool, device=self.device),
+            )
 
         self.__call__(dummy_input)
 
@@ -564,12 +695,34 @@ class PPO(TensorDictModuleBase):
 
         next_tensordict = tensordict["next"]
         with torch.no_grad():
-            self.feature_extractor.eval()
-            next_tensordict = torch.vmap(self.feature_extractor)(next_tensordict) # calculate features for next state value calculation
-            self.feature_extractor.train()
+            if self.network_type == "gru":
+                # vmap(self.feature_extractor) (the cnn/transformer path below)
+                # doesn't work here: GRUModule's step mode only supports a
+                # single batch dim, and next_tensordict is (num_env,
+                # num_frames) -- both an explicit outer vmap AND GRUModule's
+                # own internal vmap-over-extra-dims fallback hit the same
+                # "data-dependent control flow" error on its `is_init.any()`
+                # check (confirmed empirically, python_based=True does not
+                # help — that flag only affects the cuDNN-vs-python GRU cell,
+                # not this). Recurrent mode has no such restriction: it
+                # natively consumes a (num_env, num_frames) sequence using
+                # next_tensordict's own recorded is_init/recurrent_state.
+                self.feature_extractor_train.eval()
+                next_tensordict = self.feature_extractor_train(next_tensordict)
+                self.feature_extractor_train.train()
+            else:
+                self.feature_extractor.eval()
+                next_tensordict = torch.vmap(self.feature_extractor)(next_tensordict) # calculate features for next state value calculation
+                self.feature_extractor.train()
             next_values = self.critic(next_tensordict)["state_value"]
         rewards = tensordict["next", "agents", "reward"] # Reward obtained by state transition
         dones = tensordict["next", "terminated"] # Whether the next states are terminal states
+        # Same "physics crash near reset" hazard as rewards/values above, but for GAE's
+        # `not_done` term: GAE recurses backward through time, so a single NaN here
+        # poisons every earlier advantage in the same trajectory, not just one step.
+        # 0.0 (= "not done") is the safe default, matching the neutral treatment already
+        # given to a corrupted reward at that step.
+        dones = dones.nan_to_num(0.0)
 
         # Sanitize rewards and values: a physics crash on the final step before reset can
         # leave NaN in one transition; replace with 0 so GAE and ValueNorm stay clean.
@@ -592,6 +745,22 @@ class PPO(TensorDictModuleBase):
 
         # calculate GAE: Generalized Advantage Estimation
         adv, ret = self.gae(rewards, dones, values, next_values)
+        if not torch.isfinite(adv).all():
+
+            def _rawstats(name, t):
+                t = t.detach()
+                finite = torch.isfinite(t)
+                print(f"[NavRL]   {name}: min={t[finite].min().item() if finite.any() else float('nan'):.4g} "
+                      f"max={t[finite].max().item() if finite.any() else float('nan'):.4g} "
+                      f"n_nan={torch.isnan(t).sum().item()} n_inf={torch.isinf(t).sum().item()} / {t.numel()}")
+
+            print("[NavRL] raw GAE output (pre-normalization) is not finite -- inputs:")
+            _rawstats("rewards", rewards)
+            _rawstats("dones", dones)
+            _rawstats("values (denormalized)", values)
+            _rawstats("next_values (denormalized)", next_values)
+            _rawstats("adv (raw GAE output)", adv)
+            _rawstats("ret (raw GAE output)", ret)
         adv_mean = adv.mean()
         adv_std = adv.std()
         adv = (adv - adv_mean) / adv_std.clip(1e-7)
@@ -610,9 +779,13 @@ class PPO(TensorDictModuleBase):
         tensordict.set("ret", ret)
 
         # Training
+        # gru needs each minibatch's per-env time axis kept in order (BPTT
+        # through set_recurrent_mode(True)); cnn/transformer only need
+        # per-timestep independence, so they keep the original shuffle.
+        batch_fn = make_batch_recurrent if self.network_type == "gru" else make_batch
         infos = []
         for epoch in range(self.cfg.training_epoch_num):
-            batch = make_batch(tensordict, self.cfg.num_minibatches)
+            batch = batch_fn(tensordict, self.cfg.num_minibatches)
             for minibatch in batch:
                 infos.append(self._update(minibatch))
         infos = torch.stack(infos).to_tensordict()
@@ -625,7 +798,7 @@ class PPO(TensorDictModuleBase):
 
     
     def _update(self, tensordict): # tensordict shape (batch_size, )
-        self.feature_extractor(tensordict)
+        self._train_feature_extractor(tensordict)
 
         # Get action from the current policy
         action_dist = self.actor.get_dist(tensordict) # this does an actor forward to get "loc" and "scale" and use them to build multivariate normal distribution
@@ -668,6 +841,19 @@ class PPO(TensorDictModuleBase):
         if not torch.isfinite(loss).item():
             _dev = loss.device
             print(f"[NavRL] NaN/Inf loss at update step, skipping optimizer (actor={actor_loss.item():.4f}, critic={critic_loss.item():.4f}, entropy={entropy_loss.item():.4f})")
+
+            def _stats(name, t):
+                t = t.detach()
+                finite = torch.isfinite(t)
+                print(f"[NavRL]   {name}: min={t[finite].min().item() if finite.any() else float('nan'):.4g} "
+                      f"max={t[finite].max().item() if finite.any() else float('nan'):.4g} "
+                      f"n_nan={torch.isnan(t).sum().item()} n_inf={torch.isinf(t).sum().item()} / {t.numel()}")
+
+            _stats("_feature", tensordict["_feature"])
+            _stats("log_probs (current policy)", log_probs)
+            _stats("sample_log_prob (behavior policy, stored)", tensordict["sample_log_prob"])
+            _stats("advantage", advantage)
+            _stats("ratio", ratio)
             return TensorDict({
                 "actor_loss": actor_loss.detach(),
                 "critic_loss": critic_loss.detach(),

@@ -1,4 +1,15 @@
 algo:
+  # Only used when network_type: transformer (env_lidar.py gates its ring
+  # buffer on this) -- gives the 'state' (and dynamic_obstacle, when enabled)
+  # tokens a real windowed history, matching NavRL++'s active 'transformer'
+  # architecture (env.py's lidar_history/state_history/dyn_obs_state_history
+  # ring buffers). cnn/gru ignore this entirely -- env_lidar.py only builds
+  # the buffer and widens observation_spec when network_type=="transformer",
+  # so their single-frame state is byte-identical to before this was added.
+  state:
+    history_length: 2.0   # seconds of history the window should cover
+    dt: 0.5                # seconds between sampled frames within that window
+
   # Feature-extractor architecture (PPO.__init__ in ppo.py):
   #   'cnn'         (default) — depth_encoder + optional dyn-obstacle MLP,
   #                  concatenated with state, then an MLP. Unchanged behavior.
@@ -10,6 +21,12 @@ algo:
   #                  (env_dyn.num_obstacles / feature_extractor.dyn_obs_num /
   #                  feature_extractor.use_dyn_obs_net) for the "robust"
   #                  profile — see train_depth_robust.yaml.
+  #   'gru'         — depth_encoder + state (+ dyn-obstacle) CONCATENATED
+  #                  into one vector like 'cnn', then fed through a GRU that
+  #                  carries real hidden state across env steps (see
+  #                  algo.gru below). Unlike 'transformer', this is genuine
+  #                  cross-step temporal memory, not just per-timestep
+  #                  multi-modal fusion.
   network_type: cnn
 
   feature_extractor:
@@ -121,13 +138,24 @@ algo:
     max_T: 8                        # upper bound for the positional-encoding table (this pipeline's obs are single-frame, T=1)
     feature_extractor_mlp: [256, 256]
 
+  # Only used when algo.network_type: gru. Fuses depth_encoder + state (+
+  # dynamic-obstacle, mirrors feature_extractor.use_dyn_obs_net) via the same
+  # concat pattern as 'cnn' into ONE per-timestep vector, then feeds that
+  # into a GRU that carries real hidden state ACROSS ENV STEPS -- unlike
+  # 'transformer', which only fuses modalities within a single timestep.
+  gru:
+    input_size: 256    # width of the pre-GRU fusion MLP; must equal hidden_size below
+    hidden_size: 256
+    num_layers: 1
+    dropout: 0.0
+
   actor:
     learning_rate: 5e-5
     clip_ratio: 0.2   # matches depth_cnn_pretrain run (7lu8r8pv)
     action_limit: 2.0
 
   critic:
-    learning_rate: 3e-4
+    learning_rate: 5e-5
     clip_ratio: 0.2   # matches depth_cnn_pretrain run (7lu8r8pv)
 
   entropy_loss_coefficient: 1e-2
