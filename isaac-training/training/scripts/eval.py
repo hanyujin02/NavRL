@@ -108,6 +108,12 @@ def main(cfg: DictConfig):
         transformed_env.append_transform(
             make_batched_gru_primer(policy.gru_module, cfg.env.num_envs, cfg.device)
         )
+        # Critic's independent GRU (see ppo.py's asymmetric actor/critic
+        # extractor) has its own hidden-state key ("critic_recurrent_state")
+        # -- needs its own primer alongside the actor's above.
+        transformed_env.append_transform(
+            make_batched_gru_primer(policy.critic_gru_module, cfg.env.num_envs, cfg.device)
+        )
 
     # PPO overrides train() for RL — a freshly constructed policy defaults to
     # nn.Module's training=True and is never toggled, so any BatchNorm in the
@@ -116,7 +122,7 @@ def main(cfg: DictConfig):
     # never calls .eval()) — silently degrades inference, worst for frozen
     # pretrained encoders. Call eval() on submodules directly, matching what
     # evaluation/eval_noise_robustness.py already does for the same reason.
-    for m in [policy.feature_extractor, policy.actor, policy.critic]:
+    for m in [policy.feature_extractor, policy.critic_feature_extractor, policy.actor, policy.critic]:
         m.eval()
 
     # ── Warm-up rollout ───────────────────────────────────────────────────────

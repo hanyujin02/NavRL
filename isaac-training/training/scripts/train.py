@@ -97,6 +97,12 @@ def main(cfg):
         transformed_env.append_transform(
             make_batched_gru_primer(policy.gru_module, cfg.env.num_envs, cfg.device)
         )
+        # Critic's independent GRU (see ppo.py's asymmetric actor/critic
+        # extractor) has its own hidden-state key ("critic_recurrent_state")
+        # -- needs its own primer alongside the actor's above.
+        transformed_env.append_transform(
+            make_batched_gru_primer(policy.critic_gru_module, cfg.env.num_envs, cfg.device)
+        )
 
     # Episode Stats Collector
     episode_stats_keys = [
