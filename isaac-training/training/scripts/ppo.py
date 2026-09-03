@@ -424,26 +424,6 @@ class PPO(TensorDictModuleBase):
         network_type = getattr(cfg, "network_type", "cnn")
         self.network_type = network_type
 
-        # Asymmetric actor/critic feature extractor (gru only, see the "gru"
-        # branch below): critic gets its own independent CNN+GRU+MLP stack
-        # (own weights, own hidden state, own optimizer) instead of reading
-        # the actor's shared "_feature". Motivated by an explained_var
-        # regression traced to actor/critic PPO-loss gradients fighting over
-        # one shared, highly history-sensitive GRU trunk (verified via a
-        # forced-divergent-history probe: identical current observation,
-        # different history alone moved the actor's alpha/beta by ~2-9x) --
-        # matches the "asymmetric actor-critic" design used by the reference
-        # paper this GRU setup is based on (separate CNN+GRU+MLP per branch;
-        # their version also gives the critic privileged noise-free input,
-        # which this does not replicate -- not needed since this pipeline's
-        # actor isn't fed noisy observations either).
-        # cnn/transformer: unaffected, critic keeps reading the shared
-        # "_feature" exactly as before (critic_feature_key = "_feature",
-        # _critic_has_own_extractor = False short-circuits every gru-only
-        # code path below back to today's single-shared-extractor behavior).
-        self._critic_has_own_extractor = False
-        critic_feature_key = "_feature"
-
         if network_type == "cnn":
             use_dyn_obs_net = getattr(cfg.feature_extractor, "use_dyn_obs_net", True)
 
@@ -546,68 +526,6 @@ class PPO(TensorDictModuleBase):
             self.feature_extractor_train = TensorDictSequential(
                 *upstream_modules, self.gru_module.set_recurrent_mode(True)
             ).to(self.device)
-
-            # Critic's own, independently-weighted GRU+MLP stack -- same
-            # architecture/config as the actor's above, fresh instances (no
-            # shared parameters), writing to "_critic_*" keys so it can run
-            # on the same tensordict as the actor's extractor without
-            # clobbering "_feature"/"_cnn_feature". Its GRU gets its own
-            # hidden-state key ("critic_recurrent_state", via explicit
-            # in_keys/out_keys) -- the convenience in_key=/out_key= params
-            # used above always name the hidden key "recurrent_state", which
-            # would collide with the actor's if reused here. "is_init" is
-            # still the one shared reset flag (InitTracker fires once per
-            # env-reset for both GRUs alike -- that's correct, not a leak).
-            #
-            # Depth CNN: reused (not duplicated) whenever it's frozen. A
-            # frozen encoder has no gradient to fight over -- the whole
-            # motivation for decoupling (actor/critic loss gradients
-            # colliding on shared trainable weights) doesn't apply, so a
-            # second copy would only cost GPU memory/compute for an
-            # identical, unchanging function. Only build a real second
-            # instance when the encoder is actually trainable (e.g.
-            # encoder_type: scratch, or freeze_encoder: false).
-            depth_encoder_frozen = all(not p.requires_grad for p in depth_encoder.parameters())
-            critic_depth_encoder = depth_encoder if depth_encoder_frozen else build_depth_encoder(cfg.feature_extractor).to(self.device)
-            critic_upstream_modules = [
-                TensorDictModule(
-                    FlattenLeadingDims(critic_depth_encoder, n_feature_dims=3),
-                    [("agents", "observation", img_key)], ["_critic_cnn_feature"],
-                ),
-            ]
-            if use_dyn_obs_net:
-                critic_dynamic_obstacle_network = nn.Sequential(
-                    Rearrange("n c w h -> n (c w h)"),
-                    make_mlp([128, 64])
-                ).to(self.device)
-                critic_upstream_modules.append(
-                    TensorDictModule(
-                        FlattenLeadingDims(critic_dynamic_obstacle_network, n_feature_dims=3),
-                        [("agents", "observation", "dynamic_obstacle")], ["_critic_dynamic_obstacle_feature"],
-                    )
-                )
-                critic_cat_in_keys = ["_critic_cnn_feature", ("agents", "observation", "state"), "_critic_dynamic_obstacle_feature"]
-            else:
-                critic_cat_in_keys = ["_critic_cnn_feature", ("agents", "observation", "state")]
-            critic_upstream_modules.append(CatTensors(critic_cat_in_keys, "_critic_feature", del_keys=False))
-            critic_upstream_modules.append(TensorDictModule(make_mlp([gcfg.input_size]), ["_critic_feature"], ["_critic_feature"]))
-
-            self.critic_gru_module = GRUModule(
-                input_size=gcfg.input_size,
-                hidden_size=gcfg.hidden_size,
-                num_layers=getattr(gcfg, "num_layers", 1),
-                dropout=getattr(gcfg, "dropout", 0.0),
-                python_based=True,
-                device=self.device,
-                in_keys=["_critic_feature", "critic_recurrent_state"],
-                out_keys=["_critic_feature", ("next", "critic_recurrent_state")],
-            )
-            self.critic_feature_extractor = TensorDictSequential(*critic_upstream_modules, self.critic_gru_module).to(self.device)
-            self.critic_feature_extractor_train = TensorDictSequential(
-                *critic_upstream_modules, self.critic_gru_module.set_recurrent_mode(True)
-            ).to(self.device)
-            self._critic_has_own_extractor = True
-            critic_feature_key = "_critic_feature"
         else:
             raise ValueError(f"Unknown algo.network_type '{network_type}'. Choose 'cnn', 'transformer', or 'gru'.")
 
@@ -628,11 +546,9 @@ class PPO(TensorDictModuleBase):
             return_log_prob=True
         ).to(self.device)
 
-        # Critic network -- reads critic_feature_key, which is "_feature"
-        # (the shared extractor's output) for cnn/transformer, unchanged, or
-        # "_critic_feature" (its own independent extractor's output) for gru.
+        # Critic network
         self.critic = TensorDictModule(
-            nn.LazyLinear(1), [critic_feature_key], ["state_value"]
+            nn.LazyLinear(1), ["_feature"], ["state_value"] 
         ).to(self.device)
         self.value_norm = ValueNorm(1).to(self.device)
 
@@ -641,21 +557,35 @@ class PPO(TensorDictModuleBase):
         self.critic_loss_fn = nn.HuberLoss(delta=10) # huberloss (L1+L2): https://pytorch.org/docs/stable/generated/torch.nn.HuberLoss.html
 
         # Optimizer
-        self.feature_extractor_optim = torch.optim.Adam(self.feature_extractor.parameters(), lr=cfg.feature_extractor.learning_rate)
+        #
+        # The GRU trunk lives inside self.feature_extractor, so by default it
+        # inherits cfg.feature_extractor.learning_rate (1e-5) -- a rate chosen
+        # for a FROZEN pretrained encoder, not for a recurrent trunk that has
+        # to learn what to remember from scratch. cnn/transformer put only a
+        # fusion MLP there and tolerate it; the gru branch adds ~460k
+        # recurrent params on the same 1e-5, i.e. 1/5 the actor's lr and 1/30
+        # the critic's. algo.gru.learning_rate breaks that coupling by giving
+        # the GRUModule its own param group.
+        #
+        # Scope is the GRUModule only -- the pre-GRU fusion MLP stays on the
+        # feature_extractor lr, matching cnn's own fusion MLP, so a run with
+        # this set differs from the cnn baseline in the recurrence alone.
+        # null (the default) => single param group, byte-identical to before.
+        gru_lr = getattr(getattr(cfg, "gru", None), "learning_rate", None) if network_type == "gru" else None
+        if gru_lr is not None:
+            gru_param_ids = {id(p) for p in self.gru_module.parameters()}
+            self.feature_extractor_optim = torch.optim.Adam([
+                {"params": [p for p in self.feature_extractor.parameters() if id(p) not in gru_param_ids],
+                 "lr": cfg.feature_extractor.learning_rate},
+                # feature_extractor_train shares these parameter OBJECTS (see
+                # the gru branch above), so one group covers both extractors.
+                {"params": list(self.gru_module.parameters()), "lr": float(gru_lr)},
+            ])
+            print(f"[NavRL] GRU trunk lr={float(gru_lr):g} (rest of feature_extractor: {cfg.feature_extractor.learning_rate:g})")
+        else:
+            self.feature_extractor_optim = torch.optim.Adam(self.feature_extractor.parameters(), lr=cfg.feature_extractor.learning_rate)
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor.learning_rate)
         self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic.learning_rate)
-        # Only non-None for gru (own extractor -> own optimizer). For
-        # cnn/transformer, critic_feature_extractor IS self.feature_extractor
-        # (see below) and its gradients already flow through
-        # feature_extractor_optim exactly as before -- a second optimizer on
-        # the same parameters would double-step them.
-        self.critic_feature_extractor_optim = (
-            torch.optim.Adam(self.critic_feature_extractor.parameters(), lr=cfg.feature_extractor.learning_rate)
-            if self._critic_has_own_extractor else None
-        )
-        if not self._critic_has_own_extractor:
-            self.critic_feature_extractor = self.feature_extractor
-            self.critic_feature_extractor_train = self._train_feature_extractor
 
         # LR decay: factor schedule over training iterations (one per train() call).
         # Note: the iteration counter restarts at 0 when resuming from a checkpoint
@@ -665,8 +595,6 @@ class PPO(TensorDictModuleBase):
         self.lr_decay_min_factor = float(getattr(cfg, "lr_decay_min_factor", 0.1))
         self._lr_iter = 0
         self._lr_optims = [self.feature_extractor_optim, self.actor_optim, self.critic_optim]
-        if self.critic_feature_extractor_optim is not None:
-            self._lr_optims.append(self.critic_feature_extractor_optim)
         self._lr_base = [[g["lr"] for g in opt.param_groups] for opt in self._lr_optims]
         if self.lr_decay:
             print(f"[NavRL] LR decay: {self.lr_decay} over {self.lr_decay_iters} iters "
@@ -699,8 +627,6 @@ class PPO(TensorDictModuleBase):
 
     def __call__(self, tensordict):
         self.feature_extractor(tensordict)
-        if self._critic_has_own_extractor:
-            self.critic_feature_extractor(tensordict)
         self.actor(tensordict)
         self.critic(tensordict)
 
@@ -807,12 +733,9 @@ class PPO(TensorDictModuleBase):
                 # not this). Recurrent mode has no such restriction: it
                 # natively consumes a (num_env, num_frames) sequence using
                 # next_tensordict's own recorded is_init/recurrent_state.
-                # Uses the critic's OWN extractor (independent weights/hidden
-                # state from the actor's) so next_values is computed the same
-                # way "value" is in _update() below.
-                self.critic_feature_extractor_train.eval()
-                next_tensordict = self.critic_feature_extractor_train(next_tensordict)
-                self.critic_feature_extractor_train.train()
+                self.feature_extractor_train.eval()
+                next_tensordict = self.feature_extractor_train(next_tensordict)
+                self.feature_extractor_train.train()
             else:
                 self.feature_extractor.eval()
                 next_tensordict = torch.vmap(self.feature_extractor)(next_tensordict) # calculate features for next state value calculation
@@ -902,8 +825,6 @@ class PPO(TensorDictModuleBase):
     
     def _update(self, tensordict): # tensordict shape (batch_size, )
         self._train_feature_extractor(tensordict)
-        if self._critic_has_own_extractor:
-            self.critic_feature_extractor_train(tensordict)
 
         # Get action from the current policy
         action_dist = self.actor.get_dist(tensordict) # this does an actor forward to get "loc" and "scale" and use them to build multivariate normal distribution
@@ -938,8 +859,6 @@ class PPO(TensorDictModuleBase):
 
         # Optimize
         self.feature_extractor_optim.zero_grad()
-        if self.critic_feature_extractor_optim is not None:
-            self.critic_feature_extractor_optim.zero_grad()
         self.actor_optim.zero_grad()
         self.critic_optim.zero_grad()
         loss.backward()
@@ -973,9 +892,6 @@ class PPO(TensorDictModuleBase):
         actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.)
         critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.critic.parameters(), max_norm=5.)
         nn.utils.clip_grad.clip_grad_norm_(self.feature_extractor.parameters(), max_norm=5.)
-        if self.critic_feature_extractor_optim is not None:
-            nn.utils.clip_grad.clip_grad_norm_(self.critic_feature_extractor.parameters(), max_norm=5.)
-            self.critic_feature_extractor_optim.step()
         self.feature_extractor_optim.step()
         self.actor_optim.step()
         self.critic_optim.step()

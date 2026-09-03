@@ -59,7 +59,7 @@ def main(cfg):
         make_batched_gru_primer(policy.gru_module, cfg.env.num_envs, cfg.device)
     )
 
-    for m in [policy.feature_extractor, policy.critic_feature_extractor, policy.actor, policy.critic]:
+    for m in [policy.feature_extractor, policy.actor, policy.critic]:
         m.eval()
 
     hidden_key = policy.gru_module.in_keys[1]     # e.g. "recurrent_state"
