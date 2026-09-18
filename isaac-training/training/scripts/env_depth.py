@@ -111,6 +111,13 @@ class NavigationEnv(IsaacEnv):
         # obstacles. Must be set before super().__init__() — _set_specs() uses it.
         self.attitude_obs = bool(getattr(cfg.env, "attitude_obs", False))
 
+        # Same constraint as attitude_obs above. _set_specs() runs inside
+        # super().__init__() (isaac_env.py:183) and gates the cbf_clip_frac stat on
+        # this flag, so the flag has to exist before that call. Only the flag moves
+        # up -- _init_cbf_safety_reward() stays below, after the terrain it samples
+        # has been built.
+        self.use_cbf_safety_reward = bool(getattr(cfg.env, "use_cbf_safety_reward", False))
+
         super().__init__(cfg, cfg.headless)
 
         # Drone Initialization
@@ -196,7 +203,7 @@ class NavigationEnv(IsaacEnv):
         self.use_dijkstra_reward = getattr(cfg.env, "use_dijkstra_reward", False)
         if self.use_dijkstra_reward:
             self._init_dijkstra_reward()
-        self.use_cbf_safety_reward = getattr(cfg.env, "use_cbf_safety_reward", False)
+        # flag already set above, before super().__init__(); only the init runs here
         if self.use_cbf_safety_reward:
             self._init_cbf_safety_reward()
 
