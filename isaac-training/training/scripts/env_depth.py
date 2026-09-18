@@ -14,6 +14,7 @@ import oriented_obstacles
 from omni_drones.utils.torch import euler_to_quaternion, quat_axis
 from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, RayCasterCamera, RayCasterCameraCfg, patterns
 from utils import vec_to_new_frame, vec_to_world, construct_input, apply_depth_noise
+from omegaconf import OmegaConf
 import omni.isaac.core.utils.prims as prim_utils
 import omni.isaac.orbit.sim as sim_utils
 import omni.isaac.orbit.utils.math as math_utils
@@ -175,6 +176,15 @@ class NavigationEnv(IsaacEnv):
         self._dyn_obs_state_history = None
         self._state_history = None
         self._sensor_hist_write_ptr = 0
+
+        # Disturbance: per-env depth-noise "type" selection, used only when
+        # disturbance.depth_noise is a list of conditions (as opposed to a
+        # single {type: ..., ...} dict) — each env independently redraws
+        # which condition it gets every time it resets, and keeps using that
+        # one condition for the whole episode. Lazily allocated (stays None
+        # when depth_noise is a plain dict / null) so single-condition
+        # configs like train_depth_robust.yaml are unaffected.
+        self._depth_noise_idx = None
 
         # 3D policy: drop the per-episode height-band penalty and raise the
         # termination ceiling so the policy can fly over/under obstacles.
@@ -495,6 +505,11 @@ class NavigationEnv(IsaacEnv):
         self.cbf_gamma = float(getattr(self.cfg.env, "cbf_gamma", 2.0))
         self.cbf_reward_scale = float(getattr(self.cfg.env, "cbf_reward_scale", 1.0))
         self.cbf_reward_clip = float(getattr(self.cfg.env, "cbf_reward_clip", 5.0))
+        # Diagnostic: how often the raw (pre-clip) CBF condition falls below
+        # -cbf_reward_clip, i.e. the reward saturates at its floor instead of
+        # giving a graded signal. Running per-episode count, reset in
+        # _reset_idx, reported as a fraction in self.stats (see stats_spec).
+        self.cbf_clip_count = torch.zeros(self.num_envs, 1, device=self.device)
         cbf_inflate_radius = float(getattr(self.cfg.env, "cbf_obstacle_inflate_radius", 0.0))
         self.cbf_occupancy = self._build_dijkstra_occupancy(inflate_radius=cbf_inflate_radius)
 
@@ -756,15 +771,27 @@ class NavigationEnv(IsaacEnv):
             )
 
         # Observation Spec
+        obs_spec_dict = {
+            "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device),
+            img_spec_key: img_spec_val,
+            "direction": UnboundedContinuousTensorSpec((1, 3), device=self.device),
+            "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.device),
+            "lidar_fov": UnboundedContinuousTensorSpec((1, self._lidar_fov_num_rays), device=self.device),
+        }
+        # Disturbance: undistorted counterparts of depth/state, only emitted
+        # when disturbance is enabled (see disturbance.asymmetric_critic in
+        # ppo.py — the critic reads these instead of the noisy/delayed
+        # depth/state so it estimates value from ground truth while the actor
+        # still only ever sees what a real sensor would give it). Not ported
+        # for BEV (out of scope, matches every other disturbance mechanism).
+        dcfg = getattr(self.cfg, "disturbance", None)
+        self._emit_clean_obs = bool(dcfg is not None and getattr(dcfg, "enabled", False) and not self.use_bev)
+        if self._emit_clean_obs:
+            obs_spec_dict["depth_clean"] = img_spec_val
+            obs_spec_dict["state_clean"] = UnboundedContinuousTensorSpec((observation_dim,), device=self.device)
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
-                "observation": CompositeSpec({
-                    "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device),
-                    img_spec_key: img_spec_val,
-                    "direction": UnboundedContinuousTensorSpec((1, 3), device=self.device),
-                    "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.device),
-                    "lidar_fov": UnboundedContinuousTensorSpec((1, self._lidar_fov_num_rays), device=self.device),
-                }),
+                "observation": CompositeSpec(obs_spec_dict),
             }).expand(self.num_envs)
         }, shape=[self.num_envs], device=self.device)
         
@@ -790,13 +817,22 @@ class NavigationEnv(IsaacEnv):
         }).expand(self.num_envs).to(self.device) 
 
 
-        stats_spec = CompositeSpec({
+        stats_spec_dict = {
             "return": UnboundedContinuousTensorSpec(1),
             "episode_len": UnboundedContinuousTensorSpec(1),
             "reach_goal": UnboundedContinuousTensorSpec(1),
             "collision": UnboundedContinuousTensorSpec(1),
             "truncated": UnboundedContinuousTensorSpec(1),
-        }).expand(self.num_envs).to(self.device)
+        }
+        if self.use_cbf_safety_reward:
+            # Fraction of this episode's steps where the raw (pre-clip) CBF
+            # condition fell below -cbf_reward_clip -- i.e. the safety reward
+            # saturated at its floor instead of giving a graded signal.
+            # High values mean cbf_reward_clip is binding often, which is
+            # exactly the regime (near-collision) where fine-grained shaping
+            # matters most for actually reducing the collision rate.
+            stats_spec_dict["cbf_clip_frac"] = UnboundedContinuousTensorSpec(1)
+        stats_spec = CompositeSpec(stats_spec_dict).expand(self.num_envs).to(self.device)
 
         info_spec = CompositeSpec({
             "drone_state": UnboundedContinuousTensorSpec((self.drone.n, 13), device=self.device),
@@ -887,8 +923,25 @@ class NavigationEnv(IsaacEnv):
             if buf is not None:
                 buf[env_ids] = 0.
 
+        # Disturbance: redraw each resetting env's depth-noise condition
+        # (list form only — see apply_depth_noise call site for the dict
+        # form, which needs no per-env state).
+        dcfg = getattr(self.cfg, "disturbance", None)
+        if dcfg is not None and getattr(dcfg, "enabled", False):
+            noise_cfg = getattr(dcfg, "depth_noise", None)
+            if noise_cfg is not None and OmegaConf.is_list(noise_cfg):
+                if self._depth_noise_idx is None:
+                    self._depth_noise_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+                weights = torch.tensor(
+                    [float(cond.get("weight", 1.0)) for cond in noise_cfg], dtype=torch.float
+                )
+                sampled = torch.multinomial(weights, num_samples=len(env_ids), replacement=True)
+                self._depth_noise_idx[env_ids] = sampled.to(self.device)
+
         self.stats[env_ids] = 0.
-        
+        if self.use_cbf_safety_reward:
+            self.cbf_clip_count[env_ids] = 0.
+
     # ------------------------------------------------------------------ data collection
     def _collect_init_dir(self):
         """Create a timestamped output directory on the first collection step."""
@@ -1106,12 +1159,36 @@ class NavigationEnv(IsaacEnv):
             # depth_obs_divisor (== depth_range by default → [0, 1]; a larger
             # divisor rescales the frozen encoder's input, see __init__).
             depth_norm = depth_data / self.depth_obs_divisor   # (N, 1, H, W)
+            # Disturbance: undistorted depth for the asymmetric critic (see
+            # self._emit_clean_obs above) — captured before noise is applied
+            # below. apply_depth_noise() always returns a new tensor (never
+            # mutates in place), so this reference stays clean regardless.
+            depth_clean = depth_norm
 
             dcfg = getattr(self.cfg, "disturbance", None)
             if dcfg is not None and getattr(dcfg, "enabled", False) and getattr(dcfg, "depth_noise", None) is not None:
-                noise_kwargs = dict(dcfg.depth_noise)
-                noise_type = noise_kwargs.pop("type")
-                depth_norm = apply_depth_noise(depth_norm, noise_type, **noise_kwargs)
+                noise_cfg = dcfg.depth_noise
+                if OmegaConf.is_list(noise_cfg):
+                    # Per-env noise type, redrawn each episode in _reset_idx
+                    # (self._depth_noise_idx). Apply each condition once to
+                    # the whole batch and select each env's own draw with
+                    # torch.where — cheaper than masking+scattering per env.
+                    idx = self._depth_noise_idx
+                    if idx is None:
+                        idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+                    noisy = depth_norm
+                    for i, cond in enumerate(noise_cfg):
+                        mask = (idx == i)
+                        if not bool(mask.any()):
+                            continue
+                        noise_kwargs = {k: v for k, v in dict(cond).items() if k not in ("type", "weight")}
+                        candidate = apply_depth_noise(depth_norm, cond["type"], **noise_kwargs)
+                        noisy = torch.where(mask.view(-1, 1, 1, 1), candidate, noisy)
+                    depth_norm = noisy
+                else:
+                    noise_kwargs = dict(noise_cfg)
+                    noise_type = noise_kwargs.pop("type")
+                    depth_norm = apply_depth_noise(depth_norm, noise_type, **noise_kwargs)
 
             img_obs = depth_norm
 
@@ -1170,6 +1247,10 @@ class NavigationEnv(IsaacEnv):
             pitch = torch.asin((2.0 * (qw * qy - qz * qx)).clamp(-1.0, 1.0))
             state_parts.append(torch.stack([roll, pitch], dim=-1))
         drone_state = torch.cat(state_parts, dim=-1).squeeze(1)
+        # Disturbance: undistorted state for the asymmetric critic — captured
+        # before _apply_sensor_latency() below may replace drone_state with a
+        # delayed read (see depth_clean above for the same rationale).
+        state_clean = drone_state
 
         if (self.cfg.env_dyn.num_obstacles != 0):
             # ---------Network Input III: Dynamic obstacle states--------
@@ -1282,6 +1363,17 @@ class NavigationEnv(IsaacEnv):
             "dynamic_obstacle": dyn_obs_states,
             "lidar_fov": lidar_fov,
         }
+        # self.training (standard nn.Module flag, toggled by env.train()/
+        # env.eval() around each eval rollout) also gates this: eval never
+        # reads the critic's value estimate (utils.evaluate() only reads
+        # env stats), so paying to carry a second full depth image through
+        # the ~2200-step eval rollout buffer would be pure waste — and at
+        # num_envs=300 that's exactly the buffer eval_noise.yaml/utils.py's
+        # own comments already flag as memory-tight even with ONE depth
+        # image per step, not two.
+        if self._emit_clean_obs and self.training:
+            obs["depth_clean"] = depth_clean
+            obs["state_clean"] = state_clean
 
 
         # -----------------Reward Calculation-----------------
@@ -1303,6 +1395,7 @@ class NavigationEnv(IsaacEnv):
             self._debug_check_nan("cbf_hdot", cbf_hdot)
             cbf_condition = cbf_hdot + self.cbf_gamma * cbf_h
             self._debug_check_nan("cbf_condition", cbf_condition)
+            self.cbf_clip_count += (cbf_condition < -self.cbf_reward_clip).float()
             reward_safety_static = self.cbf_reward_scale * cbf_condition.clamp(
                 min=-self.cbf_reward_clip, max=0.0
             )
@@ -1390,6 +1483,8 @@ class NavigationEnv(IsaacEnv):
         self.stats["reach_goal"] = reach_goal.float()
         self.stats["collision"] = collision.float()
         self.stats["truncated"] = self.truncated.float()
+        if self.use_cbf_safety_reward:
+            self.stats["cbf_clip_frac"] = self.cbf_clip_count / self.progress_buf.clamp(min=1).unsqueeze(1)
 
         return TensorDict({
             "agents": TensorDict(

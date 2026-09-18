@@ -1,4 +1,3 @@
-import gc
 import math
 import torch
 import torch.nn as nn
@@ -346,14 +345,23 @@ class Actor(nn.Module):
         return loc, scale
 
 class BetaActor(nn.Module):
-    def __init__(self, action_dim: int) -> None:
+    # hidden_layers=[] (default) reproduces NavRL++'s original shallow head
+    # exactly: a single nn.LazyLinear straight from `features` to alpha/beta,
+    # trunk is a no-op nn.Identity(). Non-empty inserts a shared make_mlp
+    # trunk (Linear+LeakyReLU+LayerNorm per entry) before the two output
+    # heads, giving the actor's final decision real nonlinear capacity
+    # instead of a linear readout of the fused feature.
+    def __init__(self, action_dim: int, hidden_layers: list = None) -> None:
         super().__init__()
+        hidden_layers = list(hidden_layers) if hidden_layers else []
+        self.trunk = make_mlp(hidden_layers) if hidden_layers else nn.Identity()
         self.alpha_layer = nn.LazyLinear(action_dim)
         self.beta_layer = nn.LazyLinear(action_dim)
         self.alpha_softplus = nn.Softplus()
         self.beta_softplus = nn.Softplus()
-    
+
     def forward(self, features: torch.Tensor):
+        features = self.trunk(features)
         alpha = 1. + self.alpha_softplus(self.alpha_layer(features)) + 1e-6
         beta = 1. + self.beta_softplus(self.beta_layer(features)) + 1e-6
         # print("alpha: ", alpha)
@@ -447,52 +455,58 @@ def evaluate(
 
     render_callback = RenderCallback(interval=2) if eval_video else None
 
-    # No gradients needed for an eval rollout — without this, every policy
-    # forward pass across all num_envs x max_episode_length steps builds and
-    # retains a full autograd graph (saved activations for backprop that will
-    # never happen), which at num_envs=350 x 2200 steps is tens of GB on top
-    # of the raw observation/action tensors and isn't reliably reclaimed by
-    # del/gc.collect()/empty_cache() alone between successive eval() calls —
-    # OOMs a 31GB GPU by the second noise condition in eval.py's loop.
-    # return_contiguous=False deliberately: True forces one single contiguous
-    # allocation for the whole trajectory (~14.8GB of depth alone at
-    # num_envs=350), which needs one contiguous free region and OOMs sooner
-    # under a fragmented pool than many smaller per-step allocations do —
-    # confirmed empirically (OOM moved from the 2nd condition to inside the
-    # 1st when tried at num_envs=350).
-    with torch.no_grad(), set_exploration_type(exploration_type):
-        trajs = env.rollout(
-            max_steps=env.max_episode_length,
-            policy=eval_policy,
-            callback=render_callback,
-            auto_reset=True,
-            break_when_any_done=False,
-            return_contiguous=False,
-        )
-    # base_env.enable_render(not cfg.headless)
+    # Manual step_and_maybe_reset loop instead of env.rollout(max_steps=...):
+    # env.rollout() internally does `tensordicts.append(tensordict)` every
+    # step (third_party/rl/torchrl/envs/common.py's _rollout_nonstop), so its
+    # returned `trajs` holds EVERY step's full observation (depth image
+    # included) for EVERY env simultaneously -- memory there scales with
+    # num_envs * max_episode_length regardless of return_contiguous, and at
+    # num_envs=512 that OOMs a 31GB GPU well before max_episode_length=2000
+    # (confirmed empirically: utils.py:464/env.rollout, ray_caster_camera.py,
+    # CUDA OOM with ~31GB already in use). All this function actually needs
+    # per env is ONE snapshot of `stats` -- the one at that env's FIRST
+    # terminated/truncated step (env_depth.py never ends an episode on
+    # reach_goal alone, so "first done" is truncation for any run that
+    # didn't crash) -- so we track that incrementally instead of keeping the
+    # whole trajectory: memory here stays O(num_envs), independent of
+    # max_episode_length, letting num_envs and max_episode_length be tuned
+    # independently instead of trading off against each other through this
+    # function's own footprint.
+    accumulated_stats = None
+    first_done_recorded = None
+    tensordict_ = env.reset()
+    for _ in range(env.max_episode_length):
+        with torch.no_grad(), set_exploration_type(exploration_type):
+            tensordict_ = eval_policy(tensordict_)
+        tensordict, tensordict_ = env.step_and_maybe_reset(tensordict_)
+
+        stats_this_step = tensordict.get(("next", "stats"))
+        done_this_step = tensordict.get(("next", "done")).reshape(-1)
+
+        if accumulated_stats is None:
+            # Seed with step-0 values: an env that's never done by
+            # max_episode_length keeps its step-0 snapshot, matching
+            # env.rollout()'s own torch.argmax(done)-defaults-to-0 behavior
+            # when no True exists in that env's done sequence.
+            accumulated_stats = {k: v.clone() for k, v in stats_this_step.items()}
+            first_done_recorded = torch.zeros_like(done_this_step)
+
+        newly_done = done_this_step & (~first_done_recorded)
+        if newly_done.any():
+            mask_shape = (-1,) + (1,) * (next(iter(stats_this_step.values())).ndim - 1)
+            mask = newly_done.reshape(mask_shape)
+            for k, v in stats_this_step.items():
+                accumulated_stats[k] = torch.where(mask, v, accumulated_stats[k])
+        first_done_recorded = first_done_recorded | done_this_step
+
+        if render_callback is not None:
+            render_callback(env, tensordict)
+
     env.enable_render(not cfg.headless)
     env.reset()
-    
-    done = trajs.get(("next", "done"))
-    first_done = torch.argmax(done.long(), dim=1).cpu() # idx of first done will be return for each trajs
 
-    def take_first_episode(tensor: torch.Tensor):
-        indices = first_done.reshape(first_done.shape+(1,)*(tensor.ndim-2))
-        return torch.take_along_dim(tensor, indices, dim=1).reshape(-1)
-
-    traj_stats = {
-        k: take_first_episode(v)
-        for k, v in trajs[("next", "stats")].cpu().items()
-    }
-    # Free the large rollout buffer (holds all obs/depth for all envs×steps) ASAP.
-    # gc.collect() before empty_cache() matters here: at large num_envs (e.g.
-    # 350) x full episode length, this buffer is tens of GB, and without a
-    # hard collect, lingering Python-level refs (TensorDict internals) can
-    # keep the CUDA allocator from actually reclaiming it before the caller's
-    # next rollout starts.
-    del trajs, done, first_done
-    gc.collect()
-    torch.cuda.synchronize()
+    traj_stats = {k: v.reshape(-1).cpu() for k, v in accumulated_stats.items()}
+    del accumulated_stats, first_done_recorded, tensordict, tensordict_
     torch.cuda.empty_cache()
 
     info = {

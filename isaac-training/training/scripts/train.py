@@ -83,7 +83,21 @@ def main(cfg):
     )
 
     if getattr(cfg, "checkpoint", None):
-        policy.load_state_dict(torch.load(cfg.checkpoint, map_location=cfg.device))
+        # strict=False (matches eval.py): older checkpoints saved before
+        # _train_feature_extractor existed as a separate attribute only have
+        # "feature_extractor.*" keys, not "_train_feature_extractor.*" --  for
+        # cnn/transformer those are the exact same underlying module object
+        # (see ppo.py: self._train_feature_extractor = self.feature_extractor),
+        # so the "missing" keys are redundant aliases of tensors already
+        # loaded via "feature_extractor.*", not weights left uninitialized.
+        missing, unexpected = policy.load_state_dict(
+            torch.load(cfg.checkpoint, map_location=cfg.device), strict=False)
+        if missing:
+            print(f"[NavRL] resume: missing keys (left at random/current init): {missing[:8]}"
+                  + (" …" if len(missing) > 8 else ""))
+        if unexpected:
+            print(f"[NavRL] resume: unexpected keys (ignored): {unexpected[:8]}"
+                  + (" …" if len(unexpected) > 8 else ""))
         print(f"[NavRL]: resumed from checkpoint: {cfg.checkpoint}")
 
     # network_type: gru needs the env to carry an "is_init" reset flag and a
@@ -151,6 +165,18 @@ def main(cfg):
             if bool(getattr(cfg, "eval_video", True)):
                 env.enable_render(True)
             env.eval()
+            # env.eval() only flips the ENVIRONMENT's training flag (spawn
+            # randomization etc.) -- it never touches the policy. A freshly
+            # constructed policy defaults to nn.Module's training=True and
+            # nothing here toggles it, so any BatchNorm in the (possibly
+            # frozen) encoder would use live eval-batch statistics instead of
+            # the trained running stats whenever freeze_bn=false (freeze_bn
+            # only forces eval() when true -- see ReachMapEncoderWrapper's
+            # own train() override; this is a no-op then). eval.py already
+            # does this same thing for the same reason; train() below
+            # restores it for the rollout collection that resumes right after.
+            for m in [policy.feature_extractor, policy.actor, policy.critic]:
+                m.eval()
             eval_info = evaluate(
                 env=transformed_env,
                 policy=policy,
@@ -158,6 +184,8 @@ def main(cfg):
                 cfg=cfg,
                 exploration_type=ExplorationType.MEAN
             )
+            for m in [policy.feature_extractor, policy.actor, policy.critic]:
+                m.train()
             env.enable_render(not cfg.headless)
             env.train()
             env.reset()

@@ -314,7 +314,9 @@ def build_depth_encoder(cfg) -> nn.Module:
 
     if is_bev:
         enc_kwargs = dict(
-            embed_dim      = embed_dim,
+            embed_dim        = embed_dim,
+            norm_type        = getattr(cfg, "norm_type",        "batchnorm"),
+            groupnorm_groups = getattr(cfg, "groupnorm_groups", 8),
             grid_size      = getattr(cfg, "bev_grid_size",    50),
             bev_patch_size = getattr(cfg, "bev_patch_size",   10),
             vit_depth      = getattr(cfg, "vit_depth",         4),
@@ -328,7 +330,9 @@ def build_depth_encoder(cfg) -> nn.Module:
         )
     else:
         enc_kwargs = dict(
-            embed_dim      = embed_dim,
+            embed_dim        = embed_dim,
+            norm_type        = getattr(cfg, "norm_type",        "batchnorm"),
+            groupnorm_groups = getattr(cfg, "groupnorm_groups", 8),
             img_h          = getattr(cfg, "img_h",          64),
             img_w          = getattr(cfg, "img_w",          64),
             patch_size     = getattr(cfg, "patch_size",      8),
@@ -439,10 +443,14 @@ class PPO(TensorDictModuleBase):
                     TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
                 ).to(self.device)
             else:
+                # Named separately (not inlined) so disturbance.asymmetric_critic
+                # below can reuse this exact module (shared weights) for the
+                # critic-only clean-observation pass.
+                _fusion_mlp = make_mlp([256, 256])
                 self.feature_extractor = TensorDictSequential(
                     TensorDictModule(depth_encoder, [("agents", "observation", img_key)], ["_cnn_feature"]),
                     CatTensors(["_cnn_feature", ("agents", "observation", "state")], "_feature", del_keys=False),
-                    TensorDictModule(make_mlp([256, 256]), ["_feature"], ["_feature"]),
+                    TensorDictModule(_fusion_mlp, ["_feature"], ["_feature"]),
                 ).to(self.device)
         elif network_type == "transformer":
             tcfg = cfg.transformer
@@ -536,19 +544,63 @@ class PPO(TensorDictModuleBase):
             self.feature_extractor_train if network_type == "gru" else self.feature_extractor
         )
 
+        # Disturbance: asymmetric actor-critic. When on, the actor keeps
+        # seeing exactly what a real sensor would give it (noisy/delayed
+        # depth+state, unchanged above); the critic instead reads the
+        # undistorted depth_clean/state_clean the env only emits when
+        # disturbance.enabled (env_depth.py's self._emit_clean_obs) — value
+        # estimation gets ground truth even though the policy never does.
+        # feature_extractor_critic reuses the SAME depth_encoder/_fusion_mlp
+        # module objects as feature_extractor (shared weights, just a second
+        # TensorDictModule wrapper reading different keys) — one backward()
+        # call accumulates gradients from both passes onto those shared
+        # parameters, so no separate optimizer/grad-clip wiring is needed.
+        # Only wired up for the cnn/use_dyn_obs_net=false path (this
+        # pipeline's actual deploy config); anything else raises rather than
+        # silently ignoring the flag.
+        self.asymmetric_critic = bool(
+            disturbance_cfg is not None
+            and getattr(disturbance_cfg, "enabled", False)
+            and getattr(disturbance_cfg, "asymmetric_critic", False)
+        )
+        if self.asymmetric_critic:
+            if network_type != "cnn" or use_dyn_obs_net:
+                raise NotImplementedError(
+                    "disturbance.asymmetric_critic is only implemented for "
+                    "algo.network_type=cnn with feature_extractor.use_dyn_obs_net=false "
+                    f"(got network_type={network_type!r}, use_dyn_obs_net={use_dyn_obs_net!r})"
+                )
+            self.feature_extractor_critic = TensorDictSequential(
+                TensorDictModule(depth_encoder, [("agents", "observation", "depth_clean")], ["_cnn_feature_critic"]),
+                CatTensors(["_cnn_feature_critic", ("agents", "observation", "state_clean")], "_feature_critic", del_keys=False),
+                TensorDictModule(_fusion_mlp, ["_feature_critic"], ["_feature_critic"]),
+            ).to(self.device)
+        _critic_in_key = "_feature_critic" if self.asymmetric_critic else "_feature"
+
         # Actor etwork
+        # actor.hidden_layers / critic.hidden_layers ([] by default -- see
+        # ppo.yaml) let each head grow a shared nonlinear trunk (make_mlp)
+        # before its final linear output, instead of NavRL++'s original bare
+        # linear readout off `_feature`. Cheap, orthogonal probe for whether
+        # the collision-dominated SR ceiling is a head-capacity limitation.
         self.n_agents, self.action_dim = action_spec.shape
+        actor_hidden = list(getattr(cfg.actor, "hidden_layers", []) or [])
         self.actor = ProbabilisticActor(
-            TensorDictModule(BetaActor(self.action_dim), ["_feature"], ["alpha", "beta"]),
+            TensorDictModule(BetaActor(self.action_dim, hidden_layers=actor_hidden), ["_feature"], ["alpha", "beta"]),
             in_keys=["alpha", "beta"],
-            out_keys=[("agents", "action_normalized")], 
+            out_keys=[("agents", "action_normalized")],
             distribution_class=IndependentBeta,
             return_log_prob=True
         ).to(self.device)
 
         # Critic network
+        critic_hidden = list(getattr(cfg.critic, "hidden_layers", []) or [])
+        critic_module = (
+            nn.Sequential(make_mlp(critic_hidden), nn.LazyLinear(1))
+            if critic_hidden else nn.LazyLinear(1)
+        )
         self.critic = TensorDictModule(
-            nn.LazyLinear(1), ["_feature"], ["state_value"] 
+            critic_module, [_critic_in_key], ["state_value"]
         ).to(self.device)
         self.value_norm = ValueNorm(1).to(self.device)
 
@@ -627,6 +679,18 @@ class PPO(TensorDictModuleBase):
 
     def __call__(self, tensordict):
         self.feature_extractor(tensordict)
+        if self.asymmetric_critic:
+            # env_depth.py only populates depth_clean/state_clean while
+            # env.training is True — never during an eval rollout (see its
+            # _emit_clean_obs comment: eval doesn't read state_value at all,
+            # so it isn't worth doubling the depth image through a ~2200-step
+            # eval buffer). Fall back to the actor's own (noisy) "_feature"
+            # for the critic in that case rather than erroring on a missing
+            # key — the resulting state_value is simply unused by eval.
+            if tensordict.get(("agents", "observation", "depth_clean"), None) is not None:
+                self.feature_extractor_critic(tensordict)
+            else:
+                tensordict["_feature_critic"] = tensordict["_feature"]
         self.actor(tensordict)
         self.critic(tensordict)
 
@@ -733,13 +797,52 @@ class PPO(TensorDictModuleBase):
                 # not this). Recurrent mode has no such restriction: it
                 # natively consumes a (num_env, num_frames) sequence using
                 # next_tensordict's own recorded is_init/recurrent_state.
+                # Chunked along the env axis only (num_frames axis stays intact
+                # per chunk -- GRUModule's recurrent mode needs the full time
+                # axis to correctly replay is_init/recurrent_state, same as
+                # make_batch_recurrent's minibatches below). Unlike _update(),
+                # this call used to run on the WHOLE (num_envs, num_frames)
+                # tensordict in one shot -- FlattenLeadingDims folds both dims
+                # into one batch dim for the per-frame CNN encoder, so at
+                # num_envs=300+/training_frame_num=128 that's 38k+ images in a
+                # single forward. Confirmed empirically: this exact call OOM'd
+                # (model/encoder.py:99, CNN forward) at num_envs=300 and 350,
+                # while _update()'s own per-minibatch BPTT pass at this same
+                # per-chunk size never has. Reuses num_minibatches as the chunk
+                # count so both passes share one memory budget.
                 self.feature_extractor_train.eval()
-                next_tensordict = self.feature_extractor_train(next_tensordict)
+                num_chunks = max(1, int(self.cfg.num_minibatches))
+                chunk_size = -(-next_tensordict.shape[0] // num_chunks)  # ceil div
+                next_tensordict = torch.cat([
+                    self.feature_extractor_train(next_tensordict[i:i + chunk_size])
+                    for i in range(0, next_tensordict.shape[0], chunk_size)
+                ], dim=0)
                 self.feature_extractor_train.train()
             else:
+                # Chunked along the env axis for the same reason as the gru
+                # branch above (see its comment) -- torch.vmap batches the
+                # WHOLE (num_envs, num_frames) tensordict through the
+                # per-frame CNN encoder in one shot just like an unchunked
+                # direct call would; vmap is a vectorization wrapper, not a
+                # memory-saving one. Confirmed empirically: this exact line
+                # OOM'd at num_envs=512 and 1024 (ppo.py:812, 65k+ images in
+                # one CNN forward at 512x128). Reuses num_minibatches as the
+                # chunk count, same as the gru branch.
+                num_chunks = max(1, int(self.cfg.num_minibatches))
+                chunk_size = -(-next_tensordict.shape[0] // num_chunks)  # ceil div
                 self.feature_extractor.eval()
-                next_tensordict = torch.vmap(self.feature_extractor)(next_tensordict) # calculate features for next state value calculation
+                next_tensordict = torch.cat([
+                    torch.vmap(self.feature_extractor)(next_tensordict[i:i + chunk_size])
+                    for i in range(0, next_tensordict.shape[0], chunk_size)
+                ], dim=0)
                 self.feature_extractor.train()
+                if self.asymmetric_critic:
+                    self.feature_extractor_critic.eval()
+                    next_tensordict = torch.cat([
+                        torch.vmap(self.feature_extractor_critic)(next_tensordict[i:i + chunk_size])
+                        for i in range(0, next_tensordict.shape[0], chunk_size)
+                    ], dim=0)
+                    self.feature_extractor_critic.train()
             next_values = self.critic(next_tensordict)["state_value"]
         rewards = tensordict["next", "agents", "reward"] # Reward obtained by state transition
         dones = tensordict["next", "terminated"] # Whether the next states are terminal states
@@ -825,6 +928,8 @@ class PPO(TensorDictModuleBase):
     
     def _update(self, tensordict): # tensordict shape (batch_size, )
         self._train_feature_extractor(tensordict)
+        if self.asymmetric_critic:
+            self.feature_extractor_critic(tensordict)
 
         # Get action from the current policy
         action_dist = self.actor.get_dist(tensordict) # this does an actor forward to get "loc" and "scale" and use them to build multivariate normal distribution
@@ -841,6 +946,18 @@ class PPO(TensorDictModuleBase):
         # Then clamp to guard against large-but-finite divergence.
         log_ratio = (log_probs - tensordict["sample_log_prob"]).nan_to_num(0.0).clamp(-20.0, 20.0)
         ratio = torch.exp(log_ratio).unsqueeze(-1)
+        # Sanity signal: for this minibatch's FIRST optimizer step on freshly
+        # collected data (training_epoch_num=1 -> every minibatch is seen
+        # exactly once), no parameter has moved since rollout yet, so ratio
+        # should be ~1 and approx_kl ~0 by construction. A large deviation
+        # here (before any gradient has been applied) points at a replay
+        # mismatch between rollout-time and update-time forward passes
+        # (hidden state / is_init handling, BN running stats, dropout, input
+        # normalization) rather than at the optimizer being too aggressive.
+        with torch.no_grad():
+            approx_kl = torch.mean((ratio.squeeze(-1) - 1) - log_ratio)
+            ratio_mean = ratio.mean()
+            ratio_std = ratio.std()
         surr1 = advantage * ratio
         surr2 = advantage * ratio.clamp(1.-self.cfg.actor.clip_ratio, 1.+self.cfg.actor.clip_ratio)
         actor_loss = -torch.mean(torch.min(surr1, surr2)) * self.action_dim
@@ -887,6 +1004,9 @@ class PPO(TensorDictModuleBase):
                 "actor_grad_norm": torch.tensor(float("nan"), device=_dev),
                 "critic_grad_norm": torch.tensor(float("nan"), device=_dev),
                 "explained_var": torch.tensor(float("nan"), device=_dev),
+                "approx_kl": approx_kl.detach(),
+                "ratio_mean": ratio_mean.detach(),
+                "ratio_std": ratio_std.detach(),
             }, [])
 
         actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.)
@@ -903,5 +1023,8 @@ class PPO(TensorDictModuleBase):
             "actor_grad_norm": actor_grad_norm,
             "critic_grad_norm": critic_grad_norm,
             "explained_var": explained_var,
+            "approx_kl": approx_kl,
+            "ratio_mean": ratio_mean,
+            "ratio_std": ratio_std,
         }, [])
         return out
