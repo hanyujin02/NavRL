@@ -118,55 +118,6 @@ class NavigationEnv(IsaacEnv):
         # has been built.
         self.use_cbf_safety_reward = bool(getattr(cfg.env, "use_cbf_safety_reward", False))
 
-        # Heading relative to the goal, appended to the state. Same
-        # before-super() constraint as attitude_obs: it changes observation_dim,
-        # which _set_specs() reads inside super().__init__().
-        #
-        #   "none"      (default) unchanged, byte-identical to every existing run
-        #   "relative"  +2: sin/cos of (body yaw - goal azimuth)
-        #   "rate"      +3: the above, plus the per-step change in that angle
-        #   "absolute"  +2: sin/cos of body yaw alone
-        #   "both"      +4: absolute and relative together
-        #
-        # WHY THIS IS NEEDED AT ALL. The depth image is body-frame; every other
-        # state entry, and the action, are goal-frame. Turn the drone in place and
-        # the image changes completely while the goal-frame state does not move at
-        # all -- yet the correct goal-frame action is unchanged. Nothing currently
-        # in the observation reveals that rotation, and with a forest of identical
-        # pillars it cannot be inferred from the image either. (The "yaw-invariant"
-        # note on the roll/pitch block below refers to invariance under rotating
-        # the WHOLE scene, which is a different and much weaker property.)
-        #
-        # WHY "relative" IS THE STRONGER SIGNAL. The frame the image must be
-        # related to is the goal frame, whose x-axis is target_dir normalised
-        # (utils.py:538) and therefore re-drawn at every reset. The transform that
-        # is actually missing is body_yaw - goal_azimuth. Absolute body yaw alone
-        # supplies one of those two terms; the other is not in the observation and
-        # differs every episode, so on its own it is not sufficient to recover the
-        # transform. "absolute" and "both" exist to be tested, not because the
-        # information argument favours them.
-        #
-        # sin/cos throughout rather than the raw angle, which is discontinuous at
-        # +-pi and cannot be represented smoothly.
-        # How body attitude is encoded. "euler" (default) keeps the existing
-        # attitude_obs roll/pitch plus whatever yaw_obs adds. "matrix" and "rot6d"
-        # REPLACE both with the rotation itself and ignore those two keys.
-        #   matrix  +9  the full body->world R, as RA-L 26-0509 feeds it
-        #   rot6d   +6  R's first two columns; Zhou et al. CVPR 2019 show SO(3) has
-        #               no continuous representation below 5 dims, and 6D is the
-        #               minimal continuous one -- same information as matrix.
-        # (sin/cos of yaw alone is already continuous: that is SO(2) ~ S^1, which
-        # does embed in R^2. The >=5 dim result is about full SO(3).)
-        self.attitude_repr = str(getattr(cfg.env, "attitude_repr", "euler")).lower()
-        assert self.attitude_repr in ("euler", "matrix", "rot6d"), self.attitude_repr
-
-        self.yaw_obs = str(getattr(cfg.env, "yaw_obs", "none")).lower()
-        assert self.yaw_obs in ("none", "relative", "rate", "absolute", "both"), \
-            f"bad yaw_obs: {self.yaw_obs}"
-        self._yaw_obs_dim = {"none": 0, "relative": 2, "rate": 3,
-                             "absolute": 2, "both": 4}[self.yaw_obs]
-        self._prev_rel_yaw = None
-
         super().__init__(cfg, cfg.headless)
 
         # Drone Initialization
@@ -255,27 +206,6 @@ class NavigationEnv(IsaacEnv):
         # flag already set above, before super().__init__(); only the init runs here
         if self.use_cbf_safety_reward:
             self._init_cbf_safety_reward()
-
-        # Terminal event rewards. All default to 0 / False, i.e. no change.
-        #
-        # WHY THESE ARE WORTH HAVING. The step reward carries a constant +1 alive
-        # bonus, so a 2200-step episode banks ~2200 of a ~6000 return just for
-        # staying airborne, while the goal-progress term telescopes to d_0 - d_T,
-        # about 48. Arriving is therefore worth ~1-2% of the return, and since
-        # reach_goal is not a termination condition (see _compute_state_and_obs)
-        # a policy that loiters safely forever scores almost the same as one that
-        # arrives. RA-L 26-0509 shapes this explicitly with r_success/r_collision
-        # terms alongside its navigation and safety rewards.
-        #
-        # success_reward is paid ONCE, on the step the goal region is first
-        # entered -- reach_goal is an instantaneous "within 0.5 m" test that stays
-        # true while hovering there, so paying it every step would just be a
-        # second, larger alive bonus for parking on the goal.
-        self.success_reward = float(getattr(cfg.env, "success_reward", 0.0))
-        self.collision_penalty = float(getattr(cfg.env, "collision_penalty", 0.0))
-        # Own latch rather than stats["reach_goal_ever"]: the reward is computed
-        # before the stats block, so that entry still holds the previous step.
-        self._succeeded = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
 
         # Data collection (enabled via cfg.collect_data)
         if getattr(cfg, "collect_data", False):
@@ -919,10 +849,7 @@ class NavigationEnv(IsaacEnv):
 
 
     def _set_specs(self):
-        if self.attitude_repr == "euler":
-            observation_dim = (10 if self.attitude_obs else 8) + self._yaw_obs_dim
-        else:
-            observation_dim = 8 + (9 if self.attitude_repr == "matrix" else 6)
+        observation_dim = 10 if self.attitude_obs else 8
         num_dim_each_dyn_obs_state = 10
 
         if self.use_bev:
@@ -1115,11 +1042,6 @@ class NavigationEnv(IsaacEnv):
         self.stats[env_ids] = 0.
         if self.use_cbf_safety_reward:
             self.cbf_clip_count[env_ids] = 0.
-        self._succeeded[env_ids] = False
-        if self._prev_rel_yaw is not None:
-            # Forget the pre-reset heading so the first yaw rate of a new episode
-            # is not a jump across the teleport back to the start line.
-            self._prev_rel_yaw[env_ids] = 0.
 
     # ------------------------------------------------------------------ data collection
     def _collect_init_dir(self):
@@ -1418,46 +1340,13 @@ class NavigationEnv(IsaacEnv):
 
         # final drone's internal states
         state_parts = [rpos_clipped_g, distance_2d, distance_z, vel_g]
-        if self.attitude_repr != "euler":
-            # Body->world rotation from the same wxyz quaternion. (N,1,3,3).
-            R = math_utils.matrix_from_quat(self.root_state[..., 3:7])
-            cols = 3 if self.attitude_repr == "matrix" else 2
-            state_parts.append(R[..., :cols].reshape(*R.shape[:-2], 3 * cols))
-        elif self.attitude_obs:
+        if self.attitude_obs:
             # body roll/pitch (rad) from the wxyz quaternion; yaw is excluded
             # to keep the policy yaw-invariant (goal-frame formulation).
             qw, qx, qy, qz = self.root_state[..., 3], self.root_state[..., 4], self.root_state[..., 5], self.root_state[..., 6]
             roll = torch.atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy))
             pitch = torch.asin((2.0 * (qw * qy - qz * qx)).clamp(-1.0, 1.0))
             state_parts.append(torch.stack([roll, pitch], dim=-1))
-        if self._yaw_obs_dim and self.attitude_repr == "euler":
-            # Body yaw from the same wxyz quaternion, then the goal's azimuth, then
-            # the angle between them wrapped to (-pi, pi]. target_dir is the
-            # start->goal vector fixed at reset (:916), so this is "how far my
-            # camera is turned away from the direction I have to travel".
-            _qw, _qx, _qy, _qz = (self.root_state[..., 3], self.root_state[..., 4],
-                                  self.root_state[..., 5], self.root_state[..., 6])
-            body_yaw = torch.atan2(2.0 * (_qw * _qz + _qx * _qy),
-                                   1.0 - 2.0 * (_qy * _qy + _qz * _qz))
-            parts = []
-            if self.yaw_obs in ("absolute", "both"):
-                parts += [torch.sin(body_yaw), torch.cos(body_yaw)]
-            if self.yaw_obs in ("relative", "rate", "both"):
-                goal_yaw = torch.atan2(self.target_dir[..., 1], self.target_dir[..., 0])
-                rel = body_yaw - goal_yaw
-                rel = torch.atan2(torch.sin(rel), torch.cos(rel))      # wrap to (-pi, pi]
-                parts += [torch.sin(rel), torch.cos(rel)]
-            if self.yaw_obs == "rate":
-                # Per-step change, the ego-motion rotation an SRU-style transform
-                # gate would consume. Zero on the first step after a reset, where
-                # there is no previous heading to difference against.
-                if self._prev_rel_yaw is None:
-                    self._prev_rel_yaw = rel.clone()
-                d = rel - self._prev_rel_yaw
-                d = torch.atan2(torch.sin(d), torch.cos(d))
-                self._prev_rel_yaw = rel.detach().clone()
-                parts.append(d)
-            state_parts.append(torch.stack(parts, dim=-1))
         drone_state = torch.cat(state_parts, dim=-1).squeeze(1)
         # Disturbance: undistorted state for the asymmetric critic — captured
         # before _apply_sensor_latency() below may replace drone_state with a
@@ -1682,15 +1571,8 @@ class NavigationEnv(IsaacEnv):
         # Terminal reward
         # self.reward[collision] -= 50. # collision
 
-        # Terminal event rewards (no-ops at their 0.0 / False defaults)
-        if self.success_reward != 0.0:
-            first_arrival = reach_goal & (~self._succeeded)
-            self.reward = self.reward + self.success_reward * first_arrival.float()
-        if self.collision_penalty != 0.0:
-            self.reward = self.reward - self.collision_penalty * collision.float()
-        self._succeeded |= reach_goal
-
         # Terminate Conditions
+        reach_goal = (distance.squeeze(-1) < 0.5)
         below_bound = self.drone.pos[..., 2] < 0.2
         above_bound = self.drone.pos[..., 2] > (float(self.map_range[2]) if self.policy_3d else 4.)
         self.terminated = below_bound | above_bound | collision
