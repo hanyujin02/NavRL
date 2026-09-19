@@ -118,6 +118,55 @@ class NavigationEnv(IsaacEnv):
         # has been built.
         self.use_cbf_safety_reward = bool(getattr(cfg.env, "use_cbf_safety_reward", False))
 
+        # Heading relative to the goal, appended to the state. Same
+        # before-super() constraint as attitude_obs: it changes observation_dim,
+        # which _set_specs() reads inside super().__init__().
+        #
+        #   "none"      (default) unchanged, byte-identical to every existing run
+        #   "relative"  +2: sin/cos of (body yaw - goal azimuth)
+        #   "rate"      +3: the above, plus the per-step change in that angle
+        #   "absolute"  +2: sin/cos of body yaw alone
+        #   "both"      +4: absolute and relative together
+        #
+        # WHY THIS IS NEEDED AT ALL. The depth image is body-frame; every other
+        # state entry, and the action, are goal-frame. Turn the drone in place and
+        # the image changes completely while the goal-frame state does not move at
+        # all -- yet the correct goal-frame action is unchanged. Nothing currently
+        # in the observation reveals that rotation, and with a forest of identical
+        # pillars it cannot be inferred from the image either. (The "yaw-invariant"
+        # note on the roll/pitch block below refers to invariance under rotating
+        # the WHOLE scene, which is a different and much weaker property.)
+        #
+        # WHY "relative" IS THE STRONGER SIGNAL. The frame the image must be
+        # related to is the goal frame, whose x-axis is target_dir normalised
+        # (utils.py:538) and therefore re-drawn at every reset. The transform that
+        # is actually missing is body_yaw - goal_azimuth. Absolute body yaw alone
+        # supplies one of those two terms; the other is not in the observation and
+        # differs every episode, so on its own it is not sufficient to recover the
+        # transform. "absolute" and "both" exist to be tested, not because the
+        # information argument favours them.
+        #
+        # sin/cos throughout rather than the raw angle, which is discontinuous at
+        # +-pi and cannot be represented smoothly.
+        # How body attitude is encoded. "euler" (default) keeps the existing
+        # attitude_obs roll/pitch plus whatever yaw_obs adds. "matrix" and "rot6d"
+        # REPLACE both with the rotation itself and ignore those two keys.
+        #   matrix  +9  the full body->world R, as RA-L 26-0509 feeds it
+        #   rot6d   +6  R's first two columns; Zhou et al. CVPR 2019 show SO(3) has
+        #               no continuous representation below 5 dims, and 6D is the
+        #               minimal continuous one -- same information as matrix.
+        # (sin/cos of yaw alone is already continuous: that is SO(2) ~ S^1, which
+        # does embed in R^2. The >=5 dim result is about full SO(3).)
+        self.attitude_repr = str(getattr(cfg.env, "attitude_repr", "euler")).lower()
+        assert self.attitude_repr in ("euler", "matrix", "rot6d"), self.attitude_repr
+
+        self.yaw_obs = str(getattr(cfg.env, "yaw_obs", "none")).lower()
+        assert self.yaw_obs in ("none", "relative", "rate", "absolute", "both"), \
+            f"bad yaw_obs: {self.yaw_obs}"
+        self._yaw_obs_dim = {"none": 0, "relative": 2, "rate": 3,
+                             "absolute": 2, "both": 4}[self.yaw_obs]
+        self._prev_rel_yaw = None
+
         super().__init__(cfg, cfg.headless)
 
         # Drone Initialization
@@ -206,6 +255,27 @@ class NavigationEnv(IsaacEnv):
         # flag already set above, before super().__init__(); only the init runs here
         if self.use_cbf_safety_reward:
             self._init_cbf_safety_reward()
+
+        # Terminal event rewards. All default to 0 / False, i.e. no change.
+        #
+        # WHY THESE ARE WORTH HAVING. The step reward carries a constant +1 alive
+        # bonus, so a 2200-step episode banks ~2200 of a ~6000 return just for
+        # staying airborne, while the goal-progress term telescopes to d_0 - d_T,
+        # about 48. Arriving is therefore worth ~1-2% of the return, and since
+        # reach_goal is not a termination condition (see _compute_state_and_obs)
+        # a policy that loiters safely forever scores almost the same as one that
+        # arrives. RA-L 26-0509 shapes this explicitly with r_success/r_collision
+        # terms alongside its navigation and safety rewards.
+        #
+        # success_reward is paid ONCE, on the step the goal region is first
+        # entered -- reach_goal is an instantaneous "within 0.5 m" test that stays
+        # true while hovering there, so paying it every step would just be a
+        # second, larger alive bonus for parking on the goal.
+        self.success_reward = float(getattr(cfg.env, "success_reward", 0.0))
+        self.collision_penalty = float(getattr(cfg.env, "collision_penalty", 0.0))
+        # Own latch rather than stats["reach_goal_ever"]: the reward is computed
+        # before the stats block, so that entry still holds the previous step.
+        self._succeeded = torch.zeros(self.num_envs, 1, dtype=torch.bool, device=self.device)
 
         # Data collection (enabled via cfg.collect_data)
         if getattr(cfg, "collect_data", False):
@@ -493,6 +563,13 @@ class NavigationEnv(IsaacEnv):
         self.dijkstra_potential = torch.zeros(
             (self.num_envs, *self.dijkstra_shape), dtype=torch.float32, device=self.device
         )
+        # Adjacency graph, built ONCE. The occupancy grid is static, but this used
+        # to be rebuilt inside _compute_dijkstra_field_np on every call: measured
+        # 22.4 ms to build against 2.7 ms to actually solve, so ~90% of the cost
+        # was rebuilding an unchanging matrix, once per resetting env. At 512 envs
+        # a full reset wave cost ~12.8 s of blocked simulation.
+        self._dijkstra_graph = self._build_dijkstra_graph()
+        self._verify_dijkstra_batch()
         print(
             "[NavRL] Dijkstra reward enabled: "
             f"grid={self.dijkstra_shape}, extent=+/-{self.dijkstra_extent:.1f}m, "
@@ -614,6 +691,85 @@ class NavigationEnv(IsaacEnv):
                     return x, y
         return sx, sy
 
+    def _verify_dijkstra_batch(self, n: int = 3):
+        """One-off equivalence check: batched path vs the original per-target one.
+
+        ~80 ms at startup. Cheap insurance that a later edit to the cached graph or
+        the multi-source call does not silently change the potential field, which
+        would shift the navigation reward without any visible error.
+        """
+        free = np.argwhere(~self.dijkstra_occupancy)
+        if len(free) == 0:
+            return
+        pick = free[np.linspace(0, len(free) - 1, n).astype(int)]
+        xy = np.stack([
+            (pick[:, 0] + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent,
+            (pick[:, 1] + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent,
+        ], axis=1).astype(np.float64)
+        batched = self._compute_dijkstra_fields_batch(xy)
+        for i in range(n):
+            ref = self._compute_dijkstra_field_np(xy[i])
+            err = float(np.abs(batched[i] - ref).max())
+            assert err < 1e-3, f"[NavRL] Dijkstra batch mismatch at target {xy[i]}: max err {err:.3e}"
+        print(f"[NavRL] Dijkstra batched solver verified against the per-target path "
+              f"({n} targets, max err < 1e-3)")
+
+    def _build_dijkstra_graph(self):
+        """CSR adjacency over free cells, 8-connected, edge weight = hops * resolution."""
+        from scipy.sparse import csr_matrix
+        grid_h, grid_w = self.dijkstra_shape
+        free = ~self.dijkstra_occupancy
+        rows, cols, weights = [], [], []
+        xs, ys = np.where(free)
+        for dx, dy, w in self._DIJKSTRA_NEIGHBOURS:
+            nx_, ny_ = xs + dx, ys + dy
+            valid = ((nx_ >= 0) & (nx_ < grid_h) & (ny_ >= 0) & (ny_ < grid_w)
+                     & free[nx_.clip(0, grid_h - 1), ny_.clip(0, grid_w - 1)])
+            rows.extend(xs[valid] * grid_w + ys[valid])
+            cols.extend(nx_[valid] * grid_w + ny_[valid])
+            weights.extend([w * self.dijkstra_grid_resolution] * int(valid.sum()))
+        return csr_matrix((weights, (rows, cols)), shape=(grid_h * grid_w,) * 2)
+
+    _DIJKSTRA_NEIGHBOURS = (
+        (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+        (-1, -1, np.sqrt(2.0)), (-1, 1, np.sqrt(2.0)),
+        (1, -1, np.sqrt(2.0)), (1, 1, np.sqrt(2.0)),
+    )
+
+    def _compute_dijkstra_fields_batch(self, target_xy_batch):
+        """(B, 2) world targets -> (B, H, W) geodesic potential.
+
+        One multi-source scipy call over the cached graph instead of B calls that
+        each rebuild it. Numerically identical -- same solver, same graph.
+        """
+        from scipy.sparse.csgraph import dijkstra as scipy_dijkstra
+        grid_h, grid_w = self.dijkstra_shape
+        ix, iy = self._world_xy_to_dijkstra_index_np(target_xy_batch)
+        nodes = []
+        for i in range(len(ix)):
+            tx, ty = self._nearest_free_dijkstra_cell((int(ix[i]), int(iy[i])))
+            nodes.append(tx * grid_w + ty)
+        dist = scipy_dijkstra(self._dijkstra_graph, indices=np.asarray(nodes), directed=False)
+        dist = dist.reshape(len(nodes), grid_h, grid_w).astype(np.float32)
+
+        # Unreachable pockets: continue the field with Euclidean distance past the
+        # furthest reachable cell, so the gradient still points somewhere sane
+        # instead of leaving inf (which became NaN downstream). Same rule the
+        # single-target version used.
+        finite = np.isfinite(dist)
+        if not finite.all():
+            xs_ = (np.arange(grid_h, dtype=np.float32) + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent
+            ys_ = (np.arange(grid_w, dtype=np.float32) + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent
+            xx, yy = np.meshgrid(xs_, ys_, indexing="ij")
+            for i in range(len(nodes)):
+                fi = finite[i]
+                if fi.all():
+                    continue
+                max_finite = float(dist[i][fi].max()) if fi.any() else 0.0
+                fallback = np.sqrt((xx - target_xy_batch[i, 0]) ** 2 + (yy - target_xy_batch[i, 1]) ** 2)
+                dist[i][~fi] = max_finite + fallback[~fi]
+        return dist
+
     def _compute_dijkstra_field_np(self, target_xy):
         from scipy.sparse.csgraph import dijkstra as scipy_dijkstra
         grid_h, grid_w = self.dijkstra_shape
@@ -705,8 +861,8 @@ class NavigationEnv(IsaacEnv):
             return
         env_ids_cpu = env_ids.detach().cpu().numpy().astype(np.int64)
         target_xy = self.target_pos[env_ids, 0, :2].detach().cpu().numpy()
-        fields = [self._compute_dijkstra_field_np(target_xy[i]) for i in range(len(env_ids_cpu))]
-        fields_t = torch.as_tensor(np.stack(fields, axis=0), dtype=torch.float32, device=self.device)
+        fields = self._compute_dijkstra_fields_batch(target_xy)
+        fields_t = torch.as_tensor(fields, dtype=torch.float32, device=self.device)
         self.dijkstra_potential[env_ids] = fields_t
 
     def _sample_dijkstra_potential(self, pos: torch.Tensor) -> torch.Tensor:
@@ -763,7 +919,10 @@ class NavigationEnv(IsaacEnv):
 
 
     def _set_specs(self):
-        observation_dim = 10 if self.attitude_obs else 8
+        if self.attitude_repr == "euler":
+            observation_dim = (10 if self.attitude_obs else 8) + self._yaw_obs_dim
+        else:
+            observation_dim = 8 + (9 if self.attitude_repr == "matrix" else 6)
         num_dim_each_dyn_obs_state = 10
 
         if self.use_bev:
@@ -830,6 +989,14 @@ class NavigationEnv(IsaacEnv):
             "reach_goal": UnboundedContinuousTensorSpec(1),
             "collision": UnboundedContinuousTensorSpec(1),
             "truncated": UnboundedContinuousTensorSpec(1),
+            # reach_goal below is the INSTANTANEOUS "within 0.5 m", and
+            # EpisodeStats reads stats only on the done step (env.py:121-125),
+            # so it records "was at the goal when the episode ended". Reaching the
+            # goal is not a termination condition, so a policy that arrives and
+            # then drifts to 1 m logs reach_goal = 0 with a healthy return and
+            # collision rate. These two separate that case from never arriving.
+            "reach_goal_ever": UnboundedContinuousTensorSpec(1),   # max over the episode
+            "goal_distance": UnboundedContinuousTensorSpec(1),     # distance at the done step
         }
         if self.use_cbf_safety_reward:
             # Fraction of this episode's steps where the raw (pre-clip) CBF
@@ -948,6 +1115,11 @@ class NavigationEnv(IsaacEnv):
         self.stats[env_ids] = 0.
         if self.use_cbf_safety_reward:
             self.cbf_clip_count[env_ids] = 0.
+        self._succeeded[env_ids] = False
+        if self._prev_rel_yaw is not None:
+            # Forget the pre-reset heading so the first yaw rate of a new episode
+            # is not a jump across the teleport back to the start line.
+            self._prev_rel_yaw[env_ids] = 0.
 
     # ------------------------------------------------------------------ data collection
     def _collect_init_dir(self):
@@ -1246,13 +1418,46 @@ class NavigationEnv(IsaacEnv):
 
         # final drone's internal states
         state_parts = [rpos_clipped_g, distance_2d, distance_z, vel_g]
-        if self.attitude_obs:
+        if self.attitude_repr != "euler":
+            # Body->world rotation from the same wxyz quaternion. (N,1,3,3).
+            R = math_utils.matrix_from_quat(self.root_state[..., 3:7])
+            cols = 3 if self.attitude_repr == "matrix" else 2
+            state_parts.append(R[..., :cols].reshape(*R.shape[:-2], 3 * cols))
+        elif self.attitude_obs:
             # body roll/pitch (rad) from the wxyz quaternion; yaw is excluded
             # to keep the policy yaw-invariant (goal-frame formulation).
             qw, qx, qy, qz = self.root_state[..., 3], self.root_state[..., 4], self.root_state[..., 5], self.root_state[..., 6]
             roll = torch.atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy))
             pitch = torch.asin((2.0 * (qw * qy - qz * qx)).clamp(-1.0, 1.0))
             state_parts.append(torch.stack([roll, pitch], dim=-1))
+        if self._yaw_obs_dim and self.attitude_repr == "euler":
+            # Body yaw from the same wxyz quaternion, then the goal's azimuth, then
+            # the angle between them wrapped to (-pi, pi]. target_dir is the
+            # start->goal vector fixed at reset (:916), so this is "how far my
+            # camera is turned away from the direction I have to travel".
+            _qw, _qx, _qy, _qz = (self.root_state[..., 3], self.root_state[..., 4],
+                                  self.root_state[..., 5], self.root_state[..., 6])
+            body_yaw = torch.atan2(2.0 * (_qw * _qz + _qx * _qy),
+                                   1.0 - 2.0 * (_qy * _qy + _qz * _qz))
+            parts = []
+            if self.yaw_obs in ("absolute", "both"):
+                parts += [torch.sin(body_yaw), torch.cos(body_yaw)]
+            if self.yaw_obs in ("relative", "rate", "both"):
+                goal_yaw = torch.atan2(self.target_dir[..., 1], self.target_dir[..., 0])
+                rel = body_yaw - goal_yaw
+                rel = torch.atan2(torch.sin(rel), torch.cos(rel))      # wrap to (-pi, pi]
+                parts += [torch.sin(rel), torch.cos(rel)]
+            if self.yaw_obs == "rate":
+                # Per-step change, the ego-motion rotation an SRU-style transform
+                # gate would consume. Zero on the first step after a reset, where
+                # there is no previous heading to difference against.
+                if self._prev_rel_yaw is None:
+                    self._prev_rel_yaw = rel.clone()
+                d = rel - self._prev_rel_yaw
+                d = torch.atan2(torch.sin(d), torch.cos(d))
+                self._prev_rel_yaw = rel.detach().clone()
+                parts.append(d)
+            state_parts.append(torch.stack(parts, dim=-1))
         drone_state = torch.cat(state_parts, dim=-1).squeeze(1)
         # Disturbance: undistorted state for the asymmetric critic — captured
         # before _apply_sensor_latency() below may replace drone_state with a
@@ -1463,6 +1668,10 @@ class NavigationEnv(IsaacEnv):
         static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") > (self.lidar_range - 0.3)
         collision = static_collision | dynamic_collision
         
+        # Moved ahead of the reward sum: the terminal terms below need it. Same
+        # test as the termination block further down, which still reads this name.
+        reach_goal = (distance.squeeze(-1) < 0.5)
+
         # Final reward calculation
         if (self.cfg.env_dyn.num_obstacles != 0):
             self.reward = reward_vel + reward_goal + 1. + reward_safety_static * 1.0 + reward_safety_dynamic * 1.0 - penalty_smooth * 0.1 - penalty_height * 8.0
@@ -1473,8 +1682,15 @@ class NavigationEnv(IsaacEnv):
         # Terminal reward
         # self.reward[collision] -= 50. # collision
 
+        # Terminal event rewards (no-ops at their 0.0 / False defaults)
+        if self.success_reward != 0.0:
+            first_arrival = reach_goal & (~self._succeeded)
+            self.reward = self.reward + self.success_reward * first_arrival.float()
+        if self.collision_penalty != 0.0:
+            self.reward = self.reward - self.collision_penalty * collision.float()
+        self._succeeded |= reach_goal
+
         # Terminate Conditions
-        reach_goal = (distance.squeeze(-1) < 0.5)
         below_bound = self.drone.pos[..., 2] < 0.2
         above_bound = self.drone.pos[..., 2] > (float(self.map_range[2]) if self.policy_3d else 4.)
         self.terminated = below_bound | above_bound | collision
@@ -1488,6 +1704,9 @@ class NavigationEnv(IsaacEnv):
         self.stats["return"] += self.reward
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
         self.stats["reach_goal"] = reach_goal.float()
+        self.stats["reach_goal_ever"] = torch.maximum(
+            self.stats["reach_goal_ever"], reach_goal.float())
+        self.stats["goal_distance"] = distance.squeeze(-1)
         self.stats["collision"] = collision.float()
         self.stats["truncated"] = self.truncated.float()
         if self.use_cbf_safety_reward:
