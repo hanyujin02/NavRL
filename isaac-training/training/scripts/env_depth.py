@@ -524,6 +524,12 @@ class NavigationEnv(IsaacEnv):
         # giving a graded signal. Running per-episode count, reset in
         # _reset_idx, reported as a fraction in self.stats (see stats_spec).
         self.cbf_clip_count = torch.zeros(self.num_envs, 1, device=self.device)
+        # Diagnostic: per-episode running sums of |reward_safety_static| vs
+        # |reward_vel| -- answers "is cbf_reward_scale big enough to matter
+        # against the progress incentive" directly in reward units, since
+        # cbf_clip_frac only rules out the clip ceiling, not the scale itself.
+        self.cbf_reward_safety_abs_sum = torch.zeros(self.num_envs, 1, device=self.device)
+        self.cbf_reward_vel_abs_sum = torch.zeros(self.num_envs, 1, device=self.device)
         cbf_inflate_radius = float(getattr(self.cfg.env, "cbf_obstacle_inflate_radius", 0.0))
         self.cbf_occupancy = self._build_dijkstra_occupancy(inflate_radius=cbf_inflate_radius)
 
@@ -933,6 +939,11 @@ class NavigationEnv(IsaacEnv):
             # exactly the regime (near-collision) where fine-grained shaping
             # matters most for actually reducing the collision rate.
             stats_spec_dict["cbf_clip_frac"] = UnboundedContinuousTensorSpec(1)
+            # Per-episode mean |reward_safety_static| vs mean |reward_vel| --
+            # answers whether cbf_reward_scale actually matters in the reward
+            # sum, independent of whether the clip ceiling ever binds.
+            stats_spec_dict["cbf_reward_safety_abs_mean"] = UnboundedContinuousTensorSpec(1)
+            stats_spec_dict["cbf_reward_vel_abs_mean"] = UnboundedContinuousTensorSpec(1)
         stats_spec = CompositeSpec(stats_spec_dict).expand(self.num_envs).to(self.device)
 
         info_spec = CompositeSpec({
@@ -1042,6 +1053,8 @@ class NavigationEnv(IsaacEnv):
         self.stats[env_ids] = 0.
         if self.use_cbf_safety_reward:
             self.cbf_clip_count[env_ids] = 0.
+            self.cbf_reward_safety_abs_sum[env_ids] = 0.
+            self.cbf_reward_vel_abs_sum[env_ids] = 0.
 
     # ------------------------------------------------------------------ data collection
     def _collect_init_dir(self):
@@ -1556,10 +1569,14 @@ class NavigationEnv(IsaacEnv):
         # f. Collision condition with its penalty
         static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") > (self.lidar_range - 0.3)
         collision = static_collision | dynamic_collision
-        
+
         # Moved ahead of the reward sum: the terminal terms below need it. Same
         # test as the termination block further down, which still reads this name.
         reach_goal = (distance.squeeze(-1) < 0.5)
+
+        if self.use_cbf_safety_reward:
+            self.cbf_reward_safety_abs_sum += reward_safety_static.abs()
+            self.cbf_reward_vel_abs_sum += reward_vel.abs()
 
         # Final reward calculation
         if (self.cfg.env_dyn.num_obstacles != 0):
@@ -1593,6 +1610,9 @@ class NavigationEnv(IsaacEnv):
         self.stats["truncated"] = self.truncated.float()
         if self.use_cbf_safety_reward:
             self.stats["cbf_clip_frac"] = self.cbf_clip_count / self.progress_buf.clamp(min=1).unsqueeze(1)
+            _n = self.progress_buf.clamp(min=1).unsqueeze(1)
+            self.stats["cbf_reward_safety_abs_mean"] = self.cbf_reward_safety_abs_sum / _n
+            self.stats["cbf_reward_vel_abs_mean"] = self.cbf_reward_vel_abs_sum / _n
 
         return TensorDict({
             "agents": TensorDict(
