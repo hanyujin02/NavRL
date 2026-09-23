@@ -493,6 +493,13 @@ class NavigationEnv(IsaacEnv):
         self.dijkstra_potential = torch.zeros(
             (self.num_envs, *self.dijkstra_shape), dtype=torch.float32, device=self.device
         )
+        # Adjacency graph, built ONCE. The occupancy grid is static, but this used
+        # to be rebuilt inside _compute_dijkstra_field_np on every call: measured
+        # 22.4 ms to build against 2.7 ms to actually solve, so ~90% of the cost
+        # was rebuilding an unchanging matrix, once per resetting env. At 512 envs
+        # a full reset wave cost ~12.8 s of blocked simulation.
+        self._dijkstra_graph = self._build_dijkstra_graph()
+        self._verify_dijkstra_batch()
         print(
             "[NavRL] Dijkstra reward enabled: "
             f"grid={self.dijkstra_shape}, extent=+/-{self.dijkstra_extent:.1f}m, "
@@ -517,6 +524,12 @@ class NavigationEnv(IsaacEnv):
         # giving a graded signal. Running per-episode count, reset in
         # _reset_idx, reported as a fraction in self.stats (see stats_spec).
         self.cbf_clip_count = torch.zeros(self.num_envs, 1, device=self.device)
+        # Diagnostic: per-episode running sums of |reward_safety_static| vs
+        # |reward_vel| -- answers "is cbf_reward_scale big enough to matter
+        # against the progress incentive" directly in reward units, since
+        # cbf_clip_frac only rules out the clip ceiling, not the scale itself.
+        self.cbf_reward_safety_abs_sum = torch.zeros(self.num_envs, 1, device=self.device)
+        self.cbf_reward_vel_abs_sum = torch.zeros(self.num_envs, 1, device=self.device)
         cbf_inflate_radius = float(getattr(self.cfg.env, "cbf_obstacle_inflate_radius", 0.0))
         self.cbf_occupancy = self._build_dijkstra_occupancy(inflate_radius=cbf_inflate_radius)
 
@@ -614,6 +627,85 @@ class NavigationEnv(IsaacEnv):
                     return x, y
         return sx, sy
 
+    def _verify_dijkstra_batch(self, n: int = 3):
+        """One-off equivalence check: batched path vs the original per-target one.
+
+        ~80 ms at startup. Cheap insurance that a later edit to the cached graph or
+        the multi-source call does not silently change the potential field, which
+        would shift the navigation reward without any visible error.
+        """
+        free = np.argwhere(~self.dijkstra_occupancy)
+        if len(free) == 0:
+            return
+        pick = free[np.linspace(0, len(free) - 1, n).astype(int)]
+        xy = np.stack([
+            (pick[:, 0] + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent,
+            (pick[:, 1] + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent,
+        ], axis=1).astype(np.float64)
+        batched = self._compute_dijkstra_fields_batch(xy)
+        for i in range(n):
+            ref = self._compute_dijkstra_field_np(xy[i])
+            err = float(np.abs(batched[i] - ref).max())
+            assert err < 1e-3, f"[NavRL] Dijkstra batch mismatch at target {xy[i]}: max err {err:.3e}"
+        print(f"[NavRL] Dijkstra batched solver verified against the per-target path "
+              f"({n} targets, max err < 1e-3)")
+
+    def _build_dijkstra_graph(self):
+        """CSR adjacency over free cells, 8-connected, edge weight = hops * resolution."""
+        from scipy.sparse import csr_matrix
+        grid_h, grid_w = self.dijkstra_shape
+        free = ~self.dijkstra_occupancy
+        rows, cols, weights = [], [], []
+        xs, ys = np.where(free)
+        for dx, dy, w in self._DIJKSTRA_NEIGHBOURS:
+            nx_, ny_ = xs + dx, ys + dy
+            valid = ((nx_ >= 0) & (nx_ < grid_h) & (ny_ >= 0) & (ny_ < grid_w)
+                     & free[nx_.clip(0, grid_h - 1), ny_.clip(0, grid_w - 1)])
+            rows.extend(xs[valid] * grid_w + ys[valid])
+            cols.extend(nx_[valid] * grid_w + ny_[valid])
+            weights.extend([w * self.dijkstra_grid_resolution] * int(valid.sum()))
+        return csr_matrix((weights, (rows, cols)), shape=(grid_h * grid_w,) * 2)
+
+    _DIJKSTRA_NEIGHBOURS = (
+        (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+        (-1, -1, np.sqrt(2.0)), (-1, 1, np.sqrt(2.0)),
+        (1, -1, np.sqrt(2.0)), (1, 1, np.sqrt(2.0)),
+    )
+
+    def _compute_dijkstra_fields_batch(self, target_xy_batch):
+        """(B, 2) world targets -> (B, H, W) geodesic potential.
+
+        One multi-source scipy call over the cached graph instead of B calls that
+        each rebuild it. Numerically identical -- same solver, same graph.
+        """
+        from scipy.sparse.csgraph import dijkstra as scipy_dijkstra
+        grid_h, grid_w = self.dijkstra_shape
+        ix, iy = self._world_xy_to_dijkstra_index_np(target_xy_batch)
+        nodes = []
+        for i in range(len(ix)):
+            tx, ty = self._nearest_free_dijkstra_cell((int(ix[i]), int(iy[i])))
+            nodes.append(tx * grid_w + ty)
+        dist = scipy_dijkstra(self._dijkstra_graph, indices=np.asarray(nodes), directed=False)
+        dist = dist.reshape(len(nodes), grid_h, grid_w).astype(np.float32)
+
+        # Unreachable pockets: continue the field with Euclidean distance past the
+        # furthest reachable cell, so the gradient still points somewhere sane
+        # instead of leaving inf (which became NaN downstream). Same rule the
+        # single-target version used.
+        finite = np.isfinite(dist)
+        if not finite.all():
+            xs_ = (np.arange(grid_h, dtype=np.float32) + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent
+            ys_ = (np.arange(grid_w, dtype=np.float32) + 0.5) * self.dijkstra_grid_resolution - self.dijkstra_extent
+            xx, yy = np.meshgrid(xs_, ys_, indexing="ij")
+            for i in range(len(nodes)):
+                fi = finite[i]
+                if fi.all():
+                    continue
+                max_finite = float(dist[i][fi].max()) if fi.any() else 0.0
+                fallback = np.sqrt((xx - target_xy_batch[i, 0]) ** 2 + (yy - target_xy_batch[i, 1]) ** 2)
+                dist[i][~fi] = max_finite + fallback[~fi]
+        return dist
+
     def _compute_dijkstra_field_np(self, target_xy):
         from scipy.sparse.csgraph import dijkstra as scipy_dijkstra
         grid_h, grid_w = self.dijkstra_shape
@@ -705,8 +797,8 @@ class NavigationEnv(IsaacEnv):
             return
         env_ids_cpu = env_ids.detach().cpu().numpy().astype(np.int64)
         target_xy = self.target_pos[env_ids, 0, :2].detach().cpu().numpy()
-        fields = [self._compute_dijkstra_field_np(target_xy[i]) for i in range(len(env_ids_cpu))]
-        fields_t = torch.as_tensor(np.stack(fields, axis=0), dtype=torch.float32, device=self.device)
+        fields = self._compute_dijkstra_fields_batch(target_xy)
+        fields_t = torch.as_tensor(fields, dtype=torch.float32, device=self.device)
         self.dijkstra_potential[env_ids] = fields_t
 
     def _sample_dijkstra_potential(self, pos: torch.Tensor) -> torch.Tensor:
@@ -830,6 +922,14 @@ class NavigationEnv(IsaacEnv):
             "reach_goal": UnboundedContinuousTensorSpec(1),
             "collision": UnboundedContinuousTensorSpec(1),
             "truncated": UnboundedContinuousTensorSpec(1),
+            # reach_goal below is the INSTANTANEOUS "within 0.5 m", and
+            # EpisodeStats reads stats only on the done step (env.py:121-125),
+            # so it records "was at the goal when the episode ended". Reaching the
+            # goal is not a termination condition, so a policy that arrives and
+            # then drifts to 1 m logs reach_goal = 0 with a healthy return and
+            # collision rate. These two separate that case from never arriving.
+            "reach_goal_ever": UnboundedContinuousTensorSpec(1),   # max over the episode
+            "goal_distance": UnboundedContinuousTensorSpec(1),     # distance at the done step
         }
         if self.use_cbf_safety_reward:
             # Fraction of this episode's steps where the raw (pre-clip) CBF
@@ -839,6 +939,11 @@ class NavigationEnv(IsaacEnv):
             # exactly the regime (near-collision) where fine-grained shaping
             # matters most for actually reducing the collision rate.
             stats_spec_dict["cbf_clip_frac"] = UnboundedContinuousTensorSpec(1)
+            # Per-episode mean |reward_safety_static| vs mean |reward_vel| --
+            # answers whether cbf_reward_scale actually matters in the reward
+            # sum, independent of whether the clip ceiling ever binds.
+            stats_spec_dict["cbf_reward_safety_abs_mean"] = UnboundedContinuousTensorSpec(1)
+            stats_spec_dict["cbf_reward_vel_abs_mean"] = UnboundedContinuousTensorSpec(1)
         stats_spec = CompositeSpec(stats_spec_dict).expand(self.num_envs).to(self.device)
 
         info_spec = CompositeSpec({
@@ -948,6 +1053,8 @@ class NavigationEnv(IsaacEnv):
         self.stats[env_ids] = 0.
         if self.use_cbf_safety_reward:
             self.cbf_clip_count[env_ids] = 0.
+            self.cbf_reward_safety_abs_sum[env_ids] = 0.
+            self.cbf_reward_vel_abs_sum[env_ids] = 0.
 
     # ------------------------------------------------------------------ data collection
     def _collect_init_dir(self):
@@ -1462,7 +1569,15 @@ class NavigationEnv(IsaacEnv):
         # f. Collision condition with its penalty
         static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") > (self.lidar_range - 0.3)
         collision = static_collision | dynamic_collision
-        
+
+        # Moved ahead of the reward sum: the terminal terms below need it. Same
+        # test as the termination block further down, which still reads this name.
+        reach_goal = (distance.squeeze(-1) < 0.5)
+
+        if self.use_cbf_safety_reward:
+            self.cbf_reward_safety_abs_sum += reward_safety_static.abs()
+            self.cbf_reward_vel_abs_sum += reward_vel.abs()
+
         # Final reward calculation
         if (self.cfg.env_dyn.num_obstacles != 0):
             self.reward = reward_vel + reward_goal + 1. + reward_safety_static * 1.0 + reward_safety_dynamic * 1.0 - penalty_smooth * 0.1 - penalty_height * 8.0
@@ -1488,10 +1603,16 @@ class NavigationEnv(IsaacEnv):
         self.stats["return"] += self.reward
         self.stats["episode_len"][:] = self.progress_buf.unsqueeze(1)
         self.stats["reach_goal"] = reach_goal.float()
+        self.stats["reach_goal_ever"] = torch.maximum(
+            self.stats["reach_goal_ever"], reach_goal.float())
+        self.stats["goal_distance"] = distance.squeeze(-1)
         self.stats["collision"] = collision.float()
         self.stats["truncated"] = self.truncated.float()
         if self.use_cbf_safety_reward:
             self.stats["cbf_clip_frac"] = self.cbf_clip_count / self.progress_buf.clamp(min=1).unsqueeze(1)
+            _n = self.progress_buf.clamp(min=1).unsqueeze(1)
+            self.stats["cbf_reward_safety_abs_mean"] = self.cbf_reward_safety_abs_sum / _n
+            self.stats["cbf_reward_vel_abs_mean"] = self.cbf_reward_vel_abs_sum / _n
 
         return TensorDict({
             "agents": TensorDict(

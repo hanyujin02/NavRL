@@ -901,11 +901,41 @@ class PPO(TensorDictModuleBase):
             print("[NavRL] ValueNorm running stats corrupted (NaN) — resetting")
             self.value_norm.reset_parameters()
 
+        # Value-function diagnostics. MUST be computed here, while `ret` is still
+        # the raw GAE return: `values` above was denormalize()d into raw return
+        # units, and two lines below `ret` gets normalize()d into unit scale. Taking
+        # the residual across that boundary subtracts a raw-scale prediction from a
+        # normalized target, which is not a residual at all -- it reads as a value
+        # function thousands of times worse than it is.
+        #
+        # explained_var = 1 - Var(ret - V) / Var(ret). Read it together with
+        # return_var: this reward carries a constant +1 alive bonus, so a large part
+        # of every return is identical across envs and the denominator is small. Low
+        # explained_var with a small return_var is a property of the reward; low
+        # explained_var with a large return_var is a broken critic.
+        with torch.no_grad():
+            _ret = ret.detach().float()
+            _res = _ret - values.detach().float()
+            _rv = _ret.var()
+            # NOTE: no "explained_var" here. _update() already logs a correct one
+            # (ppo.py:1043) computed on the NORMALIZED ret against the freshly
+            # predicted value -- same units, the right quantity. These keys are
+            # prefixed raw_ because they are the only view of the return in real
+            # reward units, which the normalized metric cannot show: it divides by
+            # ret.var() ~= 1 by construction, so it can never tell you that the
+            # denominator is small because the alive bonus dominates the return.
+            self._value_diag = {
+                "raw_return_var": _rv.item(),
+                "raw_return_mean": _ret.mean().item(),
+                "raw_value_residual_var": _res.var().item(),
+            }
+
         self.value_norm.update(ret) # update running mean and var for return
         ret = self.value_norm.normalize(ret)  # normalize return
         ret = ret.nan_to_num(0.0)  # guard: normalize() can return NaN if stats were just reset
         tensordict.set("adv", adv)
         tensordict.set("ret", ret)
+
 
         # Training
         # gru needs each minibatch's per-env time axis kept in order (BPTT
@@ -921,6 +951,7 @@ class PPO(TensorDictModuleBase):
         
         infos = infos.apply(torch.mean, batch_size=[])
         out = {k: v.item() for k, v in infos.items()}
+        out.update(getattr(self, "_value_diag", {}))
         out["lr_factor"] = lr_factor
         out["actor_lr"] = self.actor_optim.param_groups[0]["lr"]
         return out    
@@ -933,6 +964,26 @@ class PPO(TensorDictModuleBase):
 
         # Get action from the current policy
         action_dist = self.actor.get_dist(tensordict) # this does an actor forward to get "loc" and "scale" and use them to build multivariate normal distribution
+
+        # Beta(alpha, beta) sharpness. A collapsed policy shows up here long before
+        # it shows up in the returns: concentration = alpha + beta grows without
+        # bound as the distribution spikes, and action_std is that spike expressed
+        # in the units the drone actually flies in. Var[u] = ab/((a+b)^2 (a+b+1))
+        # on [0,1]; ppo.py maps u -> 2*L*u - L, so the commanded velocity std is
+        # 2*L*sqrt(Var[u]) with L = actor.action_limit.
+        # Read the parameters off the distribution rather than the tensordict:
+        # IndependentBeta wraps torch.distributions.Beta (utils.py:325-330), whose
+        # concentration1/concentration0 ARE alpha/beta, so this cannot KeyError if
+        # get_dist ever stops writing those keys back.
+        with torch.no_grad():
+            _bd = action_dist.base_dist
+            _a = _bd.concentration1.detach().float()
+            _b = _bd.concentration0.detach().float()
+            _conc = _a + _b
+            _ustd = (_a * _b / (_conc.pow(2) * (_conc + 1.0))).sqrt()
+            beta_alpha = _a.mean()
+            beta_conc = _conc.mean()
+            action_std = 2.0 * float(self.cfg.actor.action_limit) * _ustd.mean()
         log_probs = action_dist.log_prob(tensordict[("agents", "action_normalized")]) # based on the gaussian, we can calculate the log prob of the action from the current policy
 
         # Entropy Loss
@@ -1007,6 +1058,9 @@ class PPO(TensorDictModuleBase):
                 "approx_kl": approx_kl.detach(),
                 "ratio_mean": ratio_mean.detach(),
                 "ratio_std": ratio_std.detach(),
+                "beta_alpha": beta_alpha.detach(),
+                "beta_conc": beta_conc.detach(),
+                "action_std": action_std.detach(),
             }, [])
 
         actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.)
@@ -1026,5 +1080,8 @@ class PPO(TensorDictModuleBase):
             "approx_kl": approx_kl,
             "ratio_mean": ratio_mean,
             "ratio_std": ratio_std,
+            "beta_alpha": beta_alpha,
+            "beta_conc": beta_conc,
+            "action_std": action_std,
         }, [])
         return out
