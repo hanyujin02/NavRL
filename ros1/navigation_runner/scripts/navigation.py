@@ -30,6 +30,17 @@ class Navigation:
         # Divisor for the normalized depth obs fed to the encoder — MUST match
         # sensor.depth_obs_divisor used at training time (null = depth_range).
         self.depth_obs_divisor = float(getattr(cfg.sensor, "depth_obs_divisor", None) or self.depth_range)
+        # Safety margin subtracted from every depth reading before it's fed to
+        # the policy, so the policy perceives obstacles as safe_dist metres
+        # closer than they actually are (extra stand-off buffer). 0.0
+        # (default) reproduces the old unshifted behavior.
+        self.safe_dist = float(getattr(cfg.sensor, "safe_dist", None) or 0.0)
+        # Minimum trusted reading (metres), applied uniformly to real (16UC1)
+        # and sim (32FC1) depth alike. Readings below this — the sensor's own
+        # too-close-to-be-reliable noise floor, e.g. the propeller guard's
+        # ~0.155-0.16m self-return — are treated as no-return and filled with
+        # depth_range in depth_callback. 0.0 (default) disables this.
+        self.min_valid_dist = float(getattr(cfg.sensor, "min_valid_dist", None) or 0.0)
         self.depth_image = None
         self.depth_received = False
         try:
@@ -51,6 +62,21 @@ class Navigation:
         self.height_control = rospy.get_param('~height_control', False)
         self.takeoff_height = rospy.get_param('~takeoff_height', 1.0)
         self.px4_control = rospy.get_param('rl/use_px4', True)
+        self.use_cbf = rospy.get_param('~use_cbf', False)
+        # Debug mode for pre-flight checkout: runs the full policy/CBF pipeline
+        # and publishes all the normal rviz markers, but never arms, never sets
+        # OFFBOARD, and never publishes a setpoint/velocity command — nothing
+        # actuates the vehicle either way.
+        self.dry_run = rospy.get_param('~dry_run', False)
+        if self.dry_run:
+            rospy.logwarn("[navRunner]: dry_run enabled — policy will be visualized only, no commands will be sent to the vehicle.")
+        self.depth_raw_m = None
+        # Populated once _apply_cbf runs at least once — pre/post vectors for
+        # printing + rviz comparison (cbf_vis_callback), and whether this tick's
+        # CBF pass actually changed anything (vs. just being enabled).
+        self.pre_cbf_cmd_vel_world = None
+        self.post_cbf_cmd_vel_world = None
+        self.cbf_active = False
 
         self.odom_received = False
         if self.px4_control:
@@ -77,6 +103,8 @@ class Navigation:
         self.goal_sub = rospy.Subscriber(goal_topic, PoseStamped, self.goal_callback)
         self.cmd_vis_pub = rospy.Publisher("/rl_navigation/cmd", MarkerArray, queue_size=10)
         self.goal_vis_pub = rospy.Publisher("rl_navigation/goal", MarkerArray, queue_size=10)
+        # Two arrows: pre-CBF (would-be) command vs. post-CBF (actually sent) command.
+        self.cbf_vis_pub = rospy.Publisher("/rl_navigation/cbf_cmd", MarkerArray, queue_size=10)
 
         self.policy = self.init_model()
         # PPO overrides train() for the RL update step, so it collides with
@@ -130,6 +158,16 @@ class Navigation:
             rospy.loginfo(f"[navRunner]: checkpoint extra keys (ignored): {unexpected}")
         return policy
 
+    def _publish_pose(self, pose_msg):
+        if self.dry_run:
+            return
+        self.pose_pub.publish(pose_msg)
+
+    def _publish_action(self, action_msg):
+        if self.dry_run:
+            return
+        self.action_pub.publish(action_msg)
+
     def takeoff(self):
         takeoff_height = self.takeoff_height
         r = rospy.Rate(10)
@@ -143,6 +181,11 @@ class Navigation:
         takeoff_pose.pose.position.z = takeoff_height
         takeoff_pose.pose.orientation = self.odom.pose.pose.orientation
         self.takeoff_pose = takeoff_pose
+
+        if self.dry_run:
+            print("[nav-ros]: dry_run enabled — skipping arm/OFFBOARD/takeoff. Waiting for goals to visualize the policy.")
+            return
+
         if self.px4_control:
             pose = PoseStamped()
             pose.pose.position.x = 0
@@ -187,13 +230,30 @@ class Navigation:
         import cv2
         if msg.encoding in ('32FC1', '32FC'):
             depth_np = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding='32FC1')
-        else:  # 16UC1 — millimetres
-            depth_np = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding='16UC1').astype(np.float32) / 1000.0
+        else:  # 16UC1 — millimetres; raw 0 = no return, fill with depth_range before scaling
+            raw_mm = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding='16UC1')
+            raw_mm = np.where(raw_mm == 0, np.uint16(round(self.depth_range * 1000)), raw_mm)
+            depth_np = raw_mm.astype(np.float32) / 1000.0
         if depth_np.shape != (self.depth_height, self.depth_width):
             depth_np = cv2.resize(depth_np, (self.depth_width, self.depth_height),
                                   interpolation=cv2.INTER_NEAREST)
-        depth_np = np.nan_to_num(depth_np, nan=self.depth_range, posinf=self.depth_range, neginf=0.0)
-        depth_np = np.clip(depth_np, 0.0, self.depth_range)
+        # Sim (32FC1) invalid-pixel convention: NaN = no return, +Inf = beyond
+        # far clip, -Inf = closer than near clip. Treat all three as invalid
+        # and fill with depth_range, matching the real-camera (16UC1) branch's
+        # "any invalid -> far" handling above instead of -Inf -> 0.0 (near).
+        depth_np = np.nan_to_num(depth_np, nan=self.depth_range, posinf=self.depth_range, neginf=self.depth_range)
+        if self.min_valid_dist > 0:
+            # Untrusted-close-range floor, applied uniformly to real (16UC1)
+            # and sim (32FC1) readings alike — readings closer than this are
+            # treated as no-return and pushed out to depth_range instead of a
+            # real close obstacle.
+            depth_np[depth_np < self.min_valid_dist] = self.depth_range
+        # Floor at min_valid_dist (0.0 when disabled): safe_dist shifts
+        # readings closer for margin, but shouldn't push a trusted reading
+        # below the sensor's own noise floor into a false "0m/touching" signal.
+        depth_np = np.clip(depth_np - self.safe_dist, self.min_valid_dist, self.depth_range)
+        if self.use_cbf:
+            self.depth_raw_m = depth_np.copy()
         depth_t = torch.tensor(depth_np, dtype=torch.float32, device=self.cfg.device)
         self.depth_image = (depth_t / self.depth_obs_divisor).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
         self.depth_received = True
@@ -284,16 +344,42 @@ class Navigation:
             output = self.policy(obs)
         return output["agents", "action"]
 
+    def _apply_cbf(self, cmd_vel_local, cmd_vel_world, rot_no_tilt):
+        """Deploy-time forward-braking CBF: caps the yaw-aligned forward-speed
+        component using the nearest depth reading roughly in front of the
+        camera (a central crop of the depth image — no camera intrinsics are
+        available in this deploy path, so this is a 1D scalar simplification,
+        not an omnidirectional vector CBF). h = d_min - safe_margin,
+        ḣ ~= -v_forward (conservative: obstacle assumed dead ahead), CBF
+        condition gives v_forward <= gamma * h. Never touches lateral/vertical
+        components or backward/braking commands.
+        """
+        h = self.depth_raw_m.shape[0]
+        w = self.depth_raw_m.shape[1]
+        crop_frac = float(self.cfg.cbf.crop_frac)
+        h0 = int(h * (1 - crop_frac) / 2)
+        h1 = h - h0
+        w0 = int(w * (1 - crop_frac) / 2)
+        w1 = w - w0
+        d_min = float(self.depth_raw_m[h0:h1, w0:w1].min())
+
+        forward_cap = max(0.0, float(self.cfg.cbf.gamma) * (d_min - float(self.cfg.cbf.safe_margin)))
+        if cmd_vel_local[0] > forward_cap:
+            cmd_vel_local = cmd_vel_local.copy()
+            cmd_vel_local[0] = forward_cap
+            cmd_vel_world = rot_no_tilt @ cmd_vel_local
+        return cmd_vel_local, cmd_vel_world
+
     def control_callback(self, event):
         if not self.odom_received:
             return
 
         if not self.goal_received or not self.depth_received:
-            self.pose_pub.publish(self.takeoff_pose)
+            self._publish_pose(self.takeoff_pose)
             return
 
         if self.safety_stop:
-            self.pose_pub.publish(self.stop_pose)
+            self._publish_pose(self.stop_pose)
             return
 
         goal_angle = np.arctan2(self.target_dir[1].cpu().numpy(), self.target_dir[0].cpu().numpy())
@@ -312,7 +398,7 @@ class Navigation:
             pose_msg.pose.orientation.x = quaternion[0]
             pose_msg.pose.orientation.y = quaternion[1]
             pose_msg.pose.orientation.z = quaternion[2]
-            self.pose_pub.publish(pose_msg)
+            self._publish_pose(pose_msg)
             rospy.loginfo_throttle(1.0, f"[nav-ros]: Aligning yaw — curr: {np.degrees(curr_angle):.1f} deg, goal: {np.degrees(goal_angle):.1f} deg, diff: {np.degrees(angle_diff):.1f} deg")
             return
         else:
@@ -338,13 +424,22 @@ class Navigation:
         ])
         vel_world = torch.tensor(rot @ vel_body, device=self.cfg.device, dtype=torch.float)
 
-        rospy.loginfo_throttle(1.0, f"[nav-ros]: pos=({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f})  goal=({goal[0]:.2f},{goal[1]:.2f},{goal[2]:.2f})  dist={float((pos-goal).norm()):.2f}m  depth_ok={self.depth_received}")
+        # Goal distance decided up front — closest range checked first so
+        # each threshold is actually reachable. Within the stop radius,
+        # policy inference is skipped entirely instead of running it and
+        # discarding the output.
+        distance = (pos - goal).norm()
+        rospy.loginfo_throttle(1.0, f"[nav-ros]: pos=({pos[0]:.2f},{pos[1]:.2f},{pos[2]:.2f})  goal=({goal[0]:.2f},{goal[1]:.2f},{goal[2]:.2f})  dist={float(distance):.2f}m  depth_ok={self.depth_received}")
 
-        _t0 = time.time()
-        cmd_vel_world = self.get_action(pos, vel_world, goal).squeeze(0).squeeze(0).detach().cpu().numpy()
-        rospy.loginfo_throttle(1.0, f"[nav-ros]: policy inference {(time.time()-_t0)*1000:.1f} ms")
-        self.cmd_vel_world = cmd_vel_world.copy()
-        rospy.loginfo_throttle(1.0, f"[nav-ros]: cmd_vel_world=({cmd_vel_world[0]:.2f},{cmd_vel_world[1]:.2f},{cmd_vel_world[2]:.2f})")
+        if distance <= 0.5:
+            cmd_vel_world = np.zeros(3, dtype=np.float32)
+        else:
+            _t0 = time.time()
+            cmd_vel_world = self.get_action(pos, vel_world, goal).squeeze(0).squeeze(0).detach().cpu().numpy()
+            rospy.loginfo_throttle(1.0, f"[nav-ros]: policy inference {(time.time()-_t0)*1000:.1f} ms")
+            rospy.loginfo_throttle(1.0, f"[nav-ros]: raw policy cmd_vel_world=({cmd_vel_world[0]:.2f},{cmd_vel_world[1]:.2f},{cmd_vel_world[2]:.2f})")
+            if distance <= 3.0 and np.linalg.norm(cmd_vel_world) != 0:
+                cmd_vel_world = 0.5 * cmd_vel_world / np.linalg.norm(cmd_vel_world)
 
         quat_no_tilt = tf.transformations.quaternion_from_euler(0, 0, curr_angle)
         quat_msg = Quaternion()
@@ -355,15 +450,28 @@ class Navigation:
         rot_no_tilt = self.quaternion_to_rotation_matrix(quat_msg)
         cmd_vel_local = np.linalg.inv(rot_no_tilt) @ cmd_vel_world
 
-        # Goal slowdown
-        distance = (pos - goal).norm()
-        if 0.3 < distance <= 3.:
-            if np.linalg.norm(cmd_vel_local) != 0:
-                cmd_vel_local = 0.5 * cmd_vel_local / np.linalg.norm(cmd_vel_local)
-                cmd_vel_world = 0.5 * cmd_vel_world / np.linalg.norm(cmd_vel_world)
-        elif distance <= 1.0:
-            cmd_vel_local = cmd_vel_local * 0.
-            cmd_vel_world = cmd_vel_world * 0.
+        # CBF: compare what would have been sent (pre) against what the CBF
+        # actually lets through (post) — printed + rviz-visualized only for
+        # ticks where it actually changes the command, not merely enabled.
+        pre_cbf_cmd_vel_world = cmd_vel_world.copy()
+        self.cbf_active = False
+        if self.use_cbf and self.depth_raw_m is not None:
+            cmd_vel_local, cmd_vel_world = self._apply_cbf(cmd_vel_local, cmd_vel_world, rot_no_tilt)
+            self.cbf_active = not np.allclose(cmd_vel_world, pre_cbf_cmd_vel_world, atol=1e-4)
+            if self.cbf_active:
+                rospy.loginfo_throttle(
+                    0.5,
+                    f"[nav-ros]: CBF active — "
+                    f"orig cmd_vel_world=({pre_cbf_cmd_vel_world[0]:.2f},{pre_cbf_cmd_vel_world[1]:.2f},{pre_cbf_cmd_vel_world[2]:.2f})  "
+                    f"cbf cmd_vel_world=({cmd_vel_world[0]:.2f},{cmd_vel_world[1]:.2f},{cmd_vel_world[2]:.2f})"
+                )
+        self.pre_cbf_cmd_vel_world = pre_cbf_cmd_vel_world
+        self.post_cbf_cmd_vel_world = cmd_vel_world.copy()
+        # Snapshot for cmd_vis_callback's rviz arrow — taken after goal
+        # slowdown/stop AND CBF, so the arrow actually reflects what's about
+        # to be sent (previously taken right after policy inference, so the
+        # arrow never shrank/vanished near the goal even when the command did).
+        self.cmd_vel_world = cmd_vel_world.copy()
 
         if self.px4_control:
             final_cmd_vel = PositionTarget()
@@ -399,13 +507,14 @@ class Navigation:
                 final_cmd_vel.twist.linear.z = cmd_vel_world[2]
             else:
                 final_cmd_vel.twist.linear.z = 0
-        self.action_pub.publish(final_cmd_vel)
+        self._publish_action(final_cmd_vel)
         self.has_action = True
 
     def run(self):
         rospy.Timer(rospy.Duration(0.05), self.control_callback)
         rospy.Timer(rospy.Duration(0.05), self.goal_vis_callback)
         rospy.Timer(rospy.Duration(0.05), self.cmd_vis_callback)
+        rospy.Timer(rospy.Duration(0.05), self.cbf_vis_callback)
 
     def goal_vis_callback(self, event):
         if not self.goal_received:
@@ -421,6 +530,7 @@ class Navigation:
         goal_point.pose.position.x = self.goal.pose.position.x
         goal_point.pose.position.y = self.goal.pose.position.y
         goal_point.pose.position.z = self.goal.pose.position.z
+        goal_point.pose.orientation.w = 1.0
         goal_point.lifetime = rospy.Time(0.1)
         goal_point.scale.x = 0.3
         goal_point.scale.y = 0.3
@@ -455,6 +565,7 @@ class Navigation:
 
         arrow.points.append(agent_pos)
         arrow.points.append(vel_end)
+        arrow.pose.orientation.w = 1.0
         arrow.lifetime = rospy.Duration(0.1)
         arrow.scale.x = 0.06
         arrow.scale.y = 0.06
@@ -465,3 +576,44 @@ class Navigation:
         arrow.color.b = 0.0
         msg.markers.append(arrow)
         self.cmd_vis_pub.publish(msg)
+
+    def cbf_vis_callback(self, event):
+        """Orange arrow = pre-CBF (would-be) command, green arrow = post-CBF
+        (actually sent) command — both from the drone's current position.
+        Only published once use_cbf is on and the CBF has run at least once."""
+        if not self.use_cbf or self.pre_cbf_cmd_vel_world is None:
+            return
+        agent_pos = Point()
+        agent_pos.x = self.odom.pose.pose.position.x
+        agent_pos.y = self.odom.pose.pose.position.y
+        agent_pos.z = self.odom.pose.pose.position.z
+
+        def make_arrow(marker_id, vec, r, g, b):
+            arrow = Marker()
+            arrow.header.frame_id = "map"
+            arrow.header.stamp = rospy.get_rostime()
+            arrow.ns = "cbf_cmd"
+            arrow.id = marker_id
+            arrow.type = arrow.ARROW
+            arrow.action = arrow.ADD
+            end = Point()
+            end.x = agent_pos.x + vec[0]
+            end.y = agent_pos.y + vec[1]
+            end.z = agent_pos.z + vec[2]
+            arrow.points.append(agent_pos)
+            arrow.points.append(end)
+            arrow.pose.orientation.w = 1.0
+            arrow.lifetime = rospy.Duration(0.1)
+            arrow.scale.x = 0.06
+            arrow.scale.y = 0.06
+            arrow.scale.z = 0.06
+            arrow.color.a = 1.0
+            arrow.color.r = r
+            arrow.color.g = g
+            arrow.color.b = b
+            return arrow
+
+        msg = MarkerArray()
+        msg.markers.append(make_arrow(0, self.pre_cbf_cmd_vel_world, 1.0, 0.65, 0.0))   # orange: pre-CBF
+        msg.markers.append(make_arrow(1, self.post_cbf_cmd_vel_world, 0.0, 1.0, 0.0))   # green: post-CBF
+        self.cbf_vis_pub.publish(msg)
