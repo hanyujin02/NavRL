@@ -15,7 +15,7 @@ env_script: env_depth   # selects training/scripts/env_depth.py
 # restored (optimizer/iteration count restart at 0, see train.py), and
 # max_frame_num below is raised to 12e8 so this actually gets a full
 # additional training budget instead of just finishing the last ~3%.
-checkpoint: /home/hanyujin/ReachMap/NavRL/isaac-training/wandb/run-20260830_042506-5amir9nx/files/checkpoint_89000.pt        # path to .pt file to resume from; null = train from scratch
+checkpoint: null
 headless: True
 device: "cuda:0"
 seed: 1
@@ -35,7 +35,7 @@ env:
   # 224 envs (was 350) to fit a ~16 GB GPU budget — camera/physics memory scales
   # linearly with num_envs. PPO batch size is preserved exactly via
   # algo.training_frame_num: 100 below (224 x 100 = 22400 = 350 x 64).
-  num_envs: 200
+  num_envs: 500
   max_episode_length: 2200
   env_spacing: 8.0
   num_obstacles: 300     # overrides env.yaml's env.num_obstacles (both currently 300)
@@ -65,7 +65,7 @@ viewer:
 
 wandb:
   project: NavRL-depth-deploy
-  name: depth_reach_ae_gru_test
+  name: depth_reach_ae
   entity: null            # null = use the logged-in user's default entity
   mode: online            # set to 'offline' to disable cloud sync
   run_id:
@@ -86,7 +86,8 @@ sensor:
   depth_width: 80         # image width (pixels)
   focal_length: 10.0      # ~90 deg horizontal FOV: hfov = 2*atan(aperture/(2*focal_length))
   horizontal_aperture: 20.955
-  # LiDAR for safety reward (mirrors train.yaml / env_lidar.py defaults)
+  # LiDAR for the CBF safety reward and the collision test (env_depth.py:1229,
+  # :1578) — this is depth-policy infrastructure, not the removed env_lidar env.
   lidar_range: 5.0
   lidar_vfov: [-10., 20.]   # degrees
   lidar_vbeams: 4
@@ -95,35 +96,11 @@ sensor:
 # ---------------------------------------------------------------------------
 # Encoder selection  (overrides ppo.yaml defaults)
 # ---------------------------------------------------------------------------
-# Choose one block below and uncomment it, or pass overrides on the command line.
-
-# ── Option A: Simple CNN trained from scratch (default) ──────────────────────
-# algo:
-#   feature_extractor:
-#     encoder_type: scratch
-#     embed_dim: 256
-
-# ── Option B: ReachMap CNN+GRU with pretrained checkpoint ────────────────────
-# algo:
-#   feature_extractor:
-#     encoder_type: cnn_gru
-#     encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/cnn_gru_reach+policy/best.pt
-#     freeze_encoder: false   # true = freeze encoder, train PPO heads only
-#     embed_dim: 256
-#     gru_layers: 2
-
-# ── Option C: ReachMap CNN, no temporal, fine-tuned from scratch ─────────────
-# algo:
-#   feature_extractor:
-#     encoder_type: cnn
-#     embed_dim: 256
-
-# ── Option D: ReachMap depth ViT, no temporal, trained from scratch ──────────
 algo:
   # 100 frames/iter x 224 envs = 22400 frames per PPO batch — identical to the
   # previous 350 x 64, so gradient batch statistics are unchanged.
   # training_frame_num: 100
-  network_type: gru
+  network_type: cnn
   feature_extractor:
     use_dyn_obs_net: false
     obs_image_key: depth
@@ -136,32 +113,3 @@ algo:
     projection_mlp: true
     img_h: 60
     img_w: 80
-    patch_size: 10
-    vit_depth: 4
-    num_heads: 8
-    drop: 0.1
-
-# ── Option E: ReachMap BEV CNN, no temporal, frozen backbone ─────────────────
-# algo:
-#   feature_extractor:
-#     use_dyn_obs_net: false
-#     encoder_type: bev_cnn
-#     encoder_ckpt: /home/hanyujin/ReachMap/checkpoints/debug-bev-cnn-reach-state_20260516_021556/best.pt
-#     encoder_ckpt_submodule: spatial  # load encoder.spatial.* only (backbone weights)
-#     freeze_encoder: true
-#     embed_dim: 256
-#     bev_grid_size: 50
-#     bev_map_range: 5.0
-#     bev_height_clip: 2.0
-
-# ── Option F: Pretrained vitfly RepCNN (RepBaseline) ─────────────────────────
-# algo:
-#   feature_extractor:
-#     use_dyn_obs_net: false
-#     obs_image_key: depth
-#     encoder_type: rep_cnn
-#     embed_dim: 256
-#     rep_cnn_ckpt: /home/hanyujin/RepBaseline/vitfly/models/ConvNet_model.pth
-#     freeze_encoder: true      # freeze backbone + proj; only PPO heads train
-#     rep_freeze_backbone: true # freeze the RepBaseline conv backbone itself
-#     rep_depth_max_m: 5.0      # must match sensor.depth_range

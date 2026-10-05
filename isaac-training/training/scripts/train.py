@@ -58,8 +58,10 @@ def main(cfg):
     wandb.save(os.path.join(run.dir, "*.yaml"), base_path=run.dir, policy="now")
 
     # Navigation Training Environment
-    # env_script selects env_lidar (default) or env_depth
-    _env_module = __import__(getattr(cfg, "env_script", "env_lidar"))
+    # env_script selects the environment module; env_depth is the only one left
+    # (env_lidar.py was removed 2026-10-05 — nothing referenced it but these
+    # defaults, and no shipped config set env_script to it).
+    _env_module = __import__(getattr(cfg, "env_script", "env_depth"))
     env = _env_module.NavigationEnv(cfg)
 
     # Transformed Environment
