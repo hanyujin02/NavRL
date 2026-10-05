@@ -20,6 +20,15 @@ sensor:
   depth_obs_divisor: null
   depth_height: 60     # image height in pixels
   depth_width: 80      # image width in pixels
+  # Safety margin (metres) subtracted from every depth reading before it's
+  # fed to the policy, so obstacles are perceived as this much closer than
+  # they actually are (extra stand-off buffer). 0.0 = disabled.
+  safe_dist: 0.3
+  # Trusted minimum reading (metres): 16UC1 readings below this are treated
+  # as no-return (filled with depth_range) instead of a real close obstacle.
+  # Guards against the sensor's own too-close noise floor, e.g. the
+  # propeller guard's ~0.155-0.16m self-return. 0.0 = disabled.
+  min_valid_dist: 0.2
 
 # Policy encoder — must match the architecture the checkpoint was trained with
 algo:
@@ -33,4 +42,13 @@ algo:
     obs_image_key: depth
 
   actor:
-    action_limit: 2.0  # max velocity command (m/s per axis)
+    action_limit: 1.0  # max velocity command (m/s per axis)
+
+# Deploy-time forward-braking CBF safety filter. Only read when navigation.launch's
+# use_cbf:=true; a no-op otherwise. Caps the yaw-aligned forward-speed component
+# using the nearest depth reading roughly in front of the camera:
+#   v_forward <= gamma * (d_min - safe_margin)
+cbf:
+  safe_margin: 0.5   # metres; ~ drone effective span/2 (~0.36m) + buffer
+  gamma: 2.0         # 1/s; higher = allows closer approach before braking
+  crop_frac: 0.4     # central width/height fraction of the depth image to scan

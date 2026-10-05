@@ -1,0 +1,48 @@
+# Closed-loop Gazebo success-rate / collision-rate eval.
+# Usage (after `roslaunch uav_simulator start.launch` and
+#         `roslaunch navigation_runner navigation.launch` are both up):
+#   rosrun navigation_runner gazebo_eval.py
+
+num_trials: 10
+x_range: [-8.0, 8.0]     # per-trial x positions, evenly spaced
+y_start: -12.0           # this world's obstacle field only spans roughly y in [-10, 10]
+y_goal: 12.0
+# null = auto-read /navigation_node/takeoff_height at startup. This is a 2D
+# policy (height isn't actively controlled), so the goal z MUST match the
+# running node's actual takeoff height exactly, or the 3D distance-to-goal
+# never drops below success_radius even once xy is essentially at the goal.
+# Only override this if you really want a different height than takeoff_height.
+z: null
+
+# Trials alternate sides instead of flying back to a shared start each time:
+# trial 0 flies y_start -> y_goal, trial 1 continues from there back to
+# y_start (at the next x), trial 2 y_start -> y_goal again, etc. Only trial 0
+# needs an explicit (untimed, unscored) reposition first.
+success_radius: 0.5      # matches isaac-training env_depth.py's reach_goal threshold — reaching
+                         # this ends the leg immediately, no need to wait out the full timeout
+collision_radius: 0.15   # min distance to nearest obstacle-surface point before flagging a collision
+
+# Grace period after (re)publishing a goal before collision is checked.
+# Without this, a collision still lingering from the tail end of the previous
+# leg (same odom, ~0s elapsed here) gets misattributed to the new leg.
+min_check_delay_s: 2.0
+
+# A collision is recorded but never cuts a trial leg short — the drone keeps
+# flying toward the goal regardless; only reaching the goal or trial_timeout_s
+# ends it. (Only the one-off initial reposition to trial 0's start ignores
+# collisions entirely — proximity to obstacles is irrelevant during setup.)
+
+reposition_tol: 1.0      # how close to trial 0's start counts as ready to begin
+reposition_timeout_s: 40.0
+trial_timeout_s: 60.0
+rate_hz: 10.0
+
+odom_topic: /CERLAB/quadcopter/odom
+goal_topic: /move_base_simple/goal
+
+# null = auto-resolve to uav_simulator/worlds/generated_env/generated_env_static.pcd
+# via rospkg (matches the default world start.launch loads). Override if you're
+# running a different world with its own matching .pcd.
+pcd_path: null
+
+results_dir: eval_results
