@@ -3,7 +3,7 @@ drone:
 
 sensor:
   depth_range: 5.0          # max sensing range (meters); keep aligned with ReachMap pretraining max_depth
-  depth_height: 64          # image height (pixels)
-  depth_width: 64           # image width (pixels)
+  depth_height: 60          # image height (pixels)
+  depth_width: 80           # image width (pixels)
   focal_length: 10.0        # ~90 deg horizontal FOV: hfov = 2*atan(aperture/(2*focal_length))
   horizontal_aperture: 20.955
