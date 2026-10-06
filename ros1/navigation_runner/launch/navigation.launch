@@ -1,19 +1,30 @@
 <launch>
     <!-- Control mode: set use_px4=true for real PX4 hardware, false for CERLAB sim -->
-    <arg name="use_px4"        default="false" />
+    <arg name="use_px4"        default="true" />
     <arg name="height_control" default="false" />
     <arg name="takeoff_height" default="1.0" />
 
+    <!-- Deploy-time forward-braking CBF safety filter (off by default; see
+         scripts/cfg/deploy.yaml's cbf: block for its tunables) -->
+    <arg name="use_cbf"        default="false" />
+
+    <!-- Pre-flight debug mode: runs the full policy/CBF pipeline and publishes
+         all the normal rviz markers, but never arms, sets OFFBOARD, or
+         publishes any setpoint/velocity command — nothing actuates the
+         vehicle. See navigation_debug.launch for the real-hardware preset. -->
+    <arg name="dry_run"        default="false" />
+
     <!-- Topics -->
     <arg name="depth_topic"   default="/camera/depth/image_raw" />
-    <arg name="odom_topic"    default="/CERLAB/quadcopter/odom" />  <!-- /mavros/local_position/odom for PX4 -->
+    <arg name="odom_topic"    default="/mavros/local_position/odom" />  <!-- /mavros/local_position/odom for PX4 -->
     <arg name="goal_topic"    default="/move_base_simple/goal" />
 
     <!-- Checkpoint filename (inside scripts/ckpts/) -->
-    <arg name="checkpoint"    default="checkpoint_16000.pt" />
+    <arg name="checkpoint"    default="al1.0_obs350_reachae_step2000_sr0.898_coll0.102.pt" />
+    <!-- <arg name="checkpoint"    default="cnn_reach_ae_deploy/reach_ae_350.pt" /> -->
 
     <!-- Visualization -->
-    <arg name="rviz"          default="false" />
+    <arg name="rviz"          default="true" />
 
     <param name="rl/use_px4"  value="$(arg use_px4)" />
 
@@ -24,6 +35,8 @@
         <param name="height_control" value="$(arg height_control)" />
         <param name="takeoff_height" value="$(arg takeoff_height)" />
         <param name="checkpoint"     value="$(arg checkpoint)" />
+        <param name="use_cbf"        value="$(arg use_cbf)" />
+        <param name="dry_run"        value="$(arg dry_run)" />
     </node>
 
     <group if="$(arg rviz)">
