@@ -428,6 +428,9 @@ class PPO(TensorDictModuleBase):
         network_type = getattr(cfg, "network_type", "cnn")
         self.network_type = network_type
 
+        # gru only: critic reads the pre-GRU (memoryless) feature instead of the
+        # recurrent hidden state. Set in the gru branch; see there for why.
+        self.memoryless_critic = False
         if network_type == "cnn":
             use_dyn_obs_net = getattr(cfg.feature_extractor, "use_dyn_obs_net", True)
 
@@ -511,6 +514,25 @@ class PPO(TensorDictModuleBase):
             # above, which only needs to be LazyLinear-consistent).
             upstream_modules.append(TensorDictModule(make_mlp([gcfg.input_size]), ["_feature"], ["_feature"]))
 
+            # Memoryless critic. With asymmetric_critic off (it is cnn-only) the
+            # critic would read "_feature" = the GRU hidden state -- a trainable,
+            # recurrent trunk that the actor loss keeps reshaping under it. Run
+            # 9movgk3e (batch already fixed) showed what that does: explained_var
+            # pinned at 0.06-0.34 and critic_loss spiking past 1.0 while the CNN
+            # line's critic, reading a frozen encoder + small MLP, sits at 0.99 on
+            # the same observation. Noisy values -> noisy advantages -> actor_loss
+            # ~0 -> the entropy term is the only live gradient and the policy
+            # diffuses (beta_conc 3.4 -> 2.8). So give the critic exactly what the
+            # CNN line's critic sees: the frozen "_cnn_feature" (already in the
+            # tensordict from the actor extractor above, del_keys=False) + state,
+            # through its OWN fusion MLP, no recurrence. Must run AFTER the actor
+            # extractor in every path (__call__, bootstrap, _update) -- it does.
+            self.feature_extractor_critic = TensorDictSequential(
+                CatTensors(list(cat_in_keys), "_feature_critic", del_keys=False),
+                TensorDictModule(make_mlp([gcfg.input_size]), ["_feature_critic"], ["_feature_critic"]),
+            ).to(self.device)
+            self.memoryless_critic = True
+
             # python_based=True: nn.GRU's cuDNN backend is not vmap-compatible,
             # and train() below calls torch.vmap(self.feature_extractor)(...)
             # to bootstrap next-state values — this MUST stay True or that
@@ -575,7 +597,7 @@ class PPO(TensorDictModuleBase):
                 CatTensors(["_cnn_feature_critic", ("agents", "observation", "state_clean")], "_feature_critic", del_keys=False),
                 TensorDictModule(_fusion_mlp, ["_feature_critic"], ["_feature_critic"]),
             ).to(self.device)
-        _critic_in_key = "_feature_critic" if self.asymmetric_critic else "_feature"
+        _critic_in_key = "_feature_critic" if (self.asymmetric_critic or self.memoryless_critic) else "_feature"
 
         # Actor etwork
         # actor.hidden_layers / critic.hidden_layers ([] by default -- see
@@ -637,7 +659,9 @@ class PPO(TensorDictModuleBase):
         else:
             self.feature_extractor_optim = torch.optim.Adam(self.feature_extractor.parameters(), lr=cfg.feature_extractor.learning_rate)
         self.actor_optim = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor.learning_rate)
-        self.critic_optim = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic.learning_rate)
+        _critic_params = list(self.critic.parameters()) + (
+            list(self.feature_extractor_critic.parameters()) if self.memoryless_critic else [])
+        self.critic_optim = torch.optim.Adam(_critic_params, lr=cfg.critic.learning_rate)
 
         # LR decay: factor schedule over training iterations (one per train() call).
         # Note: the iteration counter restarts at 0 when resuming from a checkpoint
@@ -679,7 +703,7 @@ class PPO(TensorDictModuleBase):
 
     def __call__(self, tensordict):
         self.feature_extractor(tensordict)
-        if self.asymmetric_critic:
+        if self.asymmetric_critic or self.memoryless_critic:
             # env_depth.py only populates depth_clean/state_clean while
             # env.training is True — never during an eval rollout (see its
             # _emit_clean_obs comment: eval doesn't read state_value at all,
@@ -687,7 +711,7 @@ class PPO(TensorDictModuleBase):
             # eval buffer). Fall back to the actor's own (noisy) "_feature"
             # for the critic in that case rather than erroring on a missing
             # key — the resulting state_value is simply unused by eval.
-            if tensordict.get(("agents", "observation", "depth_clean"), None) is not None:
+            if self.memoryless_critic or tensordict.get(("agents", "observation", "depth_clean"), None) is not None:
                 self.feature_extractor_critic(tensordict)
             else:
                 tensordict["_feature_critic"] = tensordict["_feature"]
@@ -818,6 +842,15 @@ class PPO(TensorDictModuleBase):
                     for i in range(0, next_tensordict.shape[0], chunk_size)
                 ], dim=0)
                 self.feature_extractor_train.train()
+                # Memoryless critic (gru only): its extractor is a per-timestep
+                # CatTensors + MLP over "_cnn_feature" (left in next_tensordict by
+                # the recurrent pass above, del_keys=False) + state. No recurrence,
+                # so no vmap and no chunking needed -- one call over the whole
+                # (num_envs, num_frames) tensordict is a cat and a small matmul.
+                if self.memoryless_critic:
+                    self.feature_extractor_critic.eval()
+                    next_tensordict = self.feature_extractor_critic(next_tensordict)
+                    self.feature_extractor_critic.train()
             else:
                 # Chunked along the env axis for the same reason as the gru
                 # branch above (see its comment) -- torch.vmap batches the
@@ -836,7 +869,7 @@ class PPO(TensorDictModuleBase):
                     for i in range(0, next_tensordict.shape[0], chunk_size)
                 ], dim=0)
                 self.feature_extractor.train()
-                if self.asymmetric_critic:
+                if self.asymmetric_critic or self.memoryless_critic:
                     self.feature_extractor_critic.eval()
                     next_tensordict = torch.cat([
                         torch.vmap(self.feature_extractor_critic)(next_tensordict[i:i + chunk_size])
@@ -959,7 +992,7 @@ class PPO(TensorDictModuleBase):
     
     def _update(self, tensordict): # tensordict shape (batch_size, )
         self._train_feature_extractor(tensordict)
-        if self.asymmetric_critic:
+        if self.asymmetric_critic or self.memoryless_critic:
             self.feature_extractor_critic(tensordict)
 
         # Get action from the current policy
@@ -1054,6 +1087,7 @@ class PPO(TensorDictModuleBase):
                 "entropy": entropy_loss.detach(),
                 "actor_grad_norm": torch.tensor(float("nan"), device=_dev),
                 "critic_grad_norm": torch.tensor(float("nan"), device=_dev),
+                "feature_extractor_grad_norm": torch.tensor(float("nan"), device=_dev),
                 "explained_var": torch.tensor(float("nan"), device=_dev),
                 "approx_kl": approx_kl.detach(),
                 "ratio_mean": ratio_mean.detach(),
@@ -1064,8 +1098,12 @@ class PPO(TensorDictModuleBase):
             }, [])
 
         actor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.)
-        critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.critic.parameters(), max_norm=5.)
-        nn.utils.clip_grad.clip_grad_norm_(self.feature_extractor.parameters(), max_norm=5.)
+        critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(
+            list(self.critic.parameters()) + (list(self.feature_extractor_critic.parameters()) if self.memoryless_critic else []),
+            max_norm=5.)
+        # Logged so a trunk pinned at the clip (-> effective lr collapse through
+        # 256-step BPTT) is visible; for cnn the encoder is frozen and this is tiny.
+        feature_extractor_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.feature_extractor.parameters(), max_norm=5.)
         self.feature_extractor_optim.step()
         self.actor_optim.step()
         self.critic_optim.step()
@@ -1076,6 +1114,7 @@ class PPO(TensorDictModuleBase):
             "entropy": entropy_loss,
             "actor_grad_norm": actor_grad_norm,
             "critic_grad_norm": critic_grad_norm,
+            "feature_extractor_grad_norm": feature_extractor_grad_norm,
             "explained_var": explained_var,
             "approx_kl": approx_kl,
             "ratio_mean": ratio_mean,

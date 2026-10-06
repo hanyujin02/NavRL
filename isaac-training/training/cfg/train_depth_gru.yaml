@@ -1,0 +1,63 @@
+# GRU policy on the frozen reach_ae encoder -- batch structure fixed.
+#
+# Inherits train_depth.yaml (currently the gru config: no Dijkstra, no CBF,
+# 500 envs, frozen depth-cnn-reach-ae). Reward deliberately left plain so the
+# comparison to the earlier GRU runs is clean; only the optimisation side changes.
+#
+# Why these overrides -- from the three long GRU runs (5amir9nx 29.8 h,
+# tq6xh7mm 13.3 h, iwavbe7z 5.4 h) against the CNN line:
+#
+#   1. make_batch_recurrent (utils.py:409) splits minibatches by ENV only, so
+#      each gradient step saw num_envs/num_minibatches independent trajectories:
+#      25 for 5amir9nx (200/8), 62 for today's t7qa10fo (500/8). The CNN's
+#      make_batch flattens (env x frame) and gets 8192. That is the train-SR
+#      sd of 0.257 vs the CNN's 0.097, and the collapses to 0.000 train SR at
+#      steps 32k/68k/72k/88k. 512 envs / 4 minibatches -> 128 trajectories.
+#   2. BPTT was training_frame_num x dt = 64 x 0.016 = 1.0 s (5amir9nx) or
+#      2.0 s (t7qa10fo) against a 35 s episode; eval runs the hidden state
+#      2200 steps into a regime it was never optimised over. That is the
+#      train/eval gap of 0.226 vs the CNN's 0.091. 256 frames -> 4.1 s.
+#   3. critic never settled: critic_loss p95 0.64 vs 0.006, explained_var
+#      repeatedly negative (min -3.16). Critic lr 5e-5 is 1/6 of the CNN line's
+#      3e-4; training_epoch_num 1 means every sample is seen once.
+#   4. ppo.py:613-626 -- without algo.gru.learning_rate the GRU trunk lands on
+#      the feature_extractor's 1e-5 (meant for a FROZEN encoder), i.e. 1/5 the
+#      actor's lr. Given its own group at the actor's rate.
+#
+# Memory: 512 x 256 frames doubles the rollout buffer vs the CNN line's
+# 512 x 128 (depth alone ~2.5 GB); each recurrent minibatch pushes
+# 128 x 256 = 32,768 frames through the frozen CNN. Watch the first iteration.
+defaults:
+  - train_depth
+  - _self_
+
+env:
+  num_envs: 512               # was 500
+  use_dijkstra_reward: false  # kept off on purpose (clean comparison)
+  use_cbf_safety_reward: false
+
+algo:
+  network_type: gru
+  # 2nd attempt (9movgk3e): with the batch fixed, actor_loss sat at ~0 and
+  # approx_kl at 5e-4 while beta_conc FELL 3.4 -> 2.8 and action_std rose to
+  # 1.01 over 550 iterations -- the entropy bonus was the only live gradient
+  # and diffused the policy toward uniform. Same failure the CNN warm starts
+  # showed at 1e-2 (27 -> 15). Without Dijkstra the goal term is <=0.032/step
+  # against the +1 survival term, so the policy gradient is weak from the
+  # start and cannot afford a 1e-2 entropy pull.
+  entropy_loss_coefficient: 1.0e-3   # was 1e-2 (ppo.yaml default)
+  training_frame_num: 256     # was 128 (ppo.yaml default) -> BPTT 4.1 s
+  training_epoch_num: 4       # was 1
+  # First attempt used 4 (128 trajectories/minibatch) and OOMed in the first
+  # PPO update on the 24 GB card: rollout+eval peaked at 14.3 GB, the update
+  # then reached 19.8 GB and asked for another 4.7 GB (4.8 GB of it sitting
+  # reserved-but-fragmented). 8 halves the recurrent minibatch to
+  # 64 x 256 = 16,384 frames; still 2.5x the 25 trajectories of 5amir9nx.
+  num_minibatches: 8          # was 4 (OOM) -> 64 independent trajectories / minibatch
+  critic:
+    learning_rate: 3.0e-4     # was 5e-5; matches the CNN line
+  gru:
+    learning_rate: 5.0e-5     # own param group; was inheriting feature_extractor's 1e-5
+
+wandb:
+  name: depth_reach_ae_gru_mlcritic_ent1e3
