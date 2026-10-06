@@ -168,6 +168,6 @@ algo:
   lr_decay_iters: 4e4     # iterations to reach the floor; stays at floor after
   lr_decay_min_factor: 0.1  # floor = base_lr * this factor
 
-  training_frame_num: 64
-  training_epoch_num: 2
+  training_frame_num: 128
+  training_epoch_num: 1
   num_minibatches: 8
