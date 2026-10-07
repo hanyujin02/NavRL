@@ -24,6 +24,8 @@ pip install einops
 pip install pyyaml
 pip install rospkg
 pip install matplotlib
+python -m pip install setuptools==80.9.0
+
 
 # Step 2: Install TensorDict and dependencies
 echo "Installing TensorDict dependencies..."
@@ -31,13 +33,13 @@ pip uninstall -y tensordict
 pip uninstall -y tensordict
 pip install tomli  # If missing 'tomli'
 cd ./third_party/tensordict
-python setup.py develop
+pip install -e . --no-build-isolation --no-deps
 
 
 # Step 3: Install TorchRL
 echo "Installing TorchRL..."
 cd ../rl
-python setup.py develop
+pip install -e . --no-build-isolation --no-deps
 
 # Check which torch is being used
 python -c "import torch; print(torch.__path__)"
